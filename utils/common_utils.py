@@ -13,6 +13,85 @@ from utils.logging_utils import get_config_for_wandb
 from utils.logging_utils import prepare_logging
 from utils.general import add_timestamp_with_random
 import wandb
+from data.datasets import get_dataset  # Add this import at the top
+
+from torch.utils.data import DataLoader
+import numpy as np
+import data
+from data.datasets import get_dataset  # assumes your registry/logic lives there
+
+def get_data(args, finetune_on_val=False):
+    transform_cls = getattr(data, args.data_transform)
+    train_transform = transform_cls(train=True)
+    test_transform = transform_cls(train=False)
+
+    dataset_name = args.dataset
+
+    # Dynamically handle MIL-specific args
+    mil_dataset_kwargs = {
+        "include_original": args.include_original,
+        "gradual_shrink": args.gradual_shrink,
+        "masking_strategy": args.masking_strategy,
+        "bag_size": args.bag_size,
+        "max_distance": args.max_distance,
+        "alpha": args.alpha,
+        "crop_scale": args.crop_scale,
+    } if args.use_mil else {}
+
+    # Proper key for dataset loading
+    dataset_key = "basedir" if dataset_name == "SpuriousDataset" else "data_dir"
+
+    # Load training data
+    train_kwargs = {
+        dataset_key: args.data_dir,
+        "split": "train",
+        "transform": train_transform,
+        "prop": args.train_prop,
+        "max_prop": args.max_prop,
+        **mil_dataset_kwargs
+    }
+    trainset = get_dataset(name=dataset_name, **train_kwargs)
+
+    # Load val/test data
+    holdoutsets = {}
+    for split in ["val", "test"]:
+        transform = train_transform if (split == "val" and finetune_on_val) else test_transform
+        prop = 1 if split == "test" else args.val_prop
+        split_kwargs = {
+            dataset_key: args.data_dir,
+            "split": split,
+            "transform": transform,
+            "prop": prop,
+            "max_prop": args.max_prop,
+            **mil_dataset_kwargs
+        }
+        holdoutsets[split] = get_dataset(name=dataset_name, **split_kwargs)
+
+    # Optional: move a few training samples to val set
+    if args.pass_n > 0:
+        trainset, holdoutsets = pass_data_from_train_to_val(trainset, holdoutsets, pass_n=args.pass_n)
+
+    # Optional: subsample val set
+    if args.val_size != -1:
+        print(f"Using only {args.val_size} samples of val data")
+        if args.balance_val:
+            print("Using balanced group ratios for validation set")
+            group_ratios = np.array([1 / 4] * 4)
+        else:
+            print("Using group ratios from train set for validation set")
+            group_ratios = trainset.group_counts / trainset.group_counts.sum()
+            group_ratios = group_ratios / group_ratios.sum()
+        data.subsample_to_size_and_ratio(holdoutsets["val"], args.val_size, group_ratios)
+
+    # Loaders
+    loader_kwargs = {'batch_size': args.batch_size, 'num_workers': 16, 'pin_memory': True}
+    train_loader = DataLoader(trainset, shuffle=True, **loader_kwargs)
+    holdout_loaders = {}
+    for name, ds in holdoutsets.items():
+        shuffle = (name == "val" and finetune_on_val)
+        holdout_loaders[name] = DataLoader(ds, shuffle=shuffle, **loader_kwargs)
+
+    return train_loader, holdout_loaders
 
 
 class AverageMeter:
@@ -183,6 +262,7 @@ def get_default_args():
             "Camelyon17",
             "WildsFMOW",
             "WildsCivilCommentsCoarse",
+            "masked_bag_waterbirds",
         ], help="dataset type")
     parser.add_argument("--cmnist_spurious_corr", type=float, default=0.995)
     parser.add_argument("--project", type=str, help="wandb project name")
@@ -223,6 +303,17 @@ def get_default_args():
         ])
     parser.add_argument("--tune_on", type=str, default="train")
     parser.add_argument("--grad_norm", type=float, default=-1.)
+
+    parser.add_argument('--use_mil', default=False, action='store_true', help='Use MILAttentionModel w/ masked bag inputs')
+    parser.add_argument('--include_original', action='store_true')
+    parser.add_argument('--bag_size', type=int, default=5)
+    parser.add_argument('--masking_strategy', type=str, default='mean_fill_dilation')
+    parser.add_argument('--gradual_shrink', type=str2bool, default=True)
+    parser.add_argument('--max_distance', type=float, default=30.0)
+    parser.add_argument('--alpha', type=float, default=0.1)
+    parser.add_argument('--crop_scale', type=lambda s: tuple(map(float, s.split(','))), default=(0.85, 1.0))
+
+
     return parser
 
 
@@ -270,6 +361,7 @@ def get_minimal_args():
             "CXR2",
             "WildsFMOW",
             "WildsCivilCommentsCoarse",
+            "masked_bag_waterbirds",
         ], help="dataset type")
     parser.add_argument("--project", type=str, help="wandb project name")
     parser.add_argument("--output_dir", type=str, help="output directory")
@@ -336,6 +428,17 @@ def get_embeddings_args():
     parser.add_argument("--val_size", type=int, default=-1)
     parser.add_argument("--batch_size", type=int, default=100)
     parser.add_argument("--emb_batch_size", type=int, default=-1)
+
+    # MIL
+    parser.add_argument('--include_original', action='store_true')
+    parser.add_argument('--bag_size', type=int, default=5)
+    parser.add_argument('--masking_strategy', type=str, default='mean_fill_dilation')
+    parser.add_argument('--gradual_shrink', type=str2bool, default=True)
+    parser.add_argument('--use_mil', default=False, action='store_true', help='Use MILAttentionModel w/ masked bag inputs')
+    parser.add_argument('--max_distance', type=float, default=30.0)
+    parser.add_argument('--alpha', type=float, default=0.1)
+    parser.add_argument('--crop_scale', type=lambda s: tuple(map(float, s.split(','))), default=(0.85, 1.0))
+
     return parser
 
 
@@ -406,57 +509,57 @@ def get_shrinked_data(subset, data_dir, split, data_transform):
     dataset = dataset_cls(basedir=data_dir, subset=subset, split=split, transform=transform)
     return dataset
 
-def get_data(args, finetune_on_val=False):
-    transform_cls = getattr(data, args.data_transform)
-    train_transform = transform_cls(train=True)
-    test_transform = transform_cls(train=False)
+# def get_data(args, finetune_on_val=False):
+#     transform_cls = getattr(data, args.data_transform)
+#     train_transform = transform_cls(train=True)
+#     test_transform = transform_cls(train=False)
 
-    dataset_cls = getattr(data, args.dataset)
-    if args.dataset.__contains__("Colored"):
-        dataset_cls = partial(dataset_cls, spurious_correlation=args.cmnist_spurious_corr)
-    trainset = dataset_cls(basedir=args.data_dir, split="train", transform=train_transform,
-                           prop=args.train_prop, max_prop=args.max_prop)
+#     dataset_cls = getattr(data, args.dataset)
+#     if args.dataset.__contains__("Colored"):
+#         dataset_cls = partial(dataset_cls, spurious_correlation=args.cmnist_spurious_corr)
+#     trainset = dataset_cls(basedir=args.data_dir, split="train", transform=train_transform,
+#                            prop=args.train_prop, max_prop=args.max_prop)
 
-    holdoutsets = {}
-    for split in ["val", "test"]:
-        transform = train_transform if (split == "val" and finetune_on_val) else test_transform
-        # transform = train_transform if (split == "test" and finetune_on_val) else test_transform
-        prop = 1 if split == "test" else args.val_prop
-        holdoutsets[split] = dataset_cls(basedir=args.data_dir, split=split, transform=transform,
-                                         prop=prop)
+#     holdoutsets = {}
+#     for split in ["val", "test"]:
+#         transform = train_transform if (split == "val" and finetune_on_val) else test_transform
+#         # transform = train_transform if (split == "test" and finetune_on_val) else test_transform
+#         prop = 1 if split == "test" else args.val_prop
+#         holdoutsets[split] = dataset_cls(basedir=args.data_dir, split=split, transform=transform,
+#                                          prop=prop)
 
-    if args.pass_n > 0:
-        trainset, holdoutsets = pass_data_from_train_to_val(trainset, holdoutsets,
-                                                            pass_n=args.pass_n)
+#     if args.pass_n > 0:
+#         trainset, holdoutsets = pass_data_from_train_to_val(trainset, holdoutsets,
+#                                                             pass_n=args.pass_n)
 
-    if args.val_size != -1:
-        print(f"Using only {args.val_size} samples of val data")
-        if args.balance_val:
-            print("Using balanced group ratios for validation set")
-            group_ratios = np.array([1 / 4] * 4)
-        else:
-            print("Using group ratios from train set for validation set")
-            group_ratios = trainset.group_counts / trainset.group_counts.sum()
-            group_ratios = group_ratios / group_ratios.sum()
-        data.subsample_to_size_and_ratio(holdoutsets["val"], args.val_size, group_ratios)
-        # data.subsample_to_size_and_ratio(holdoutsets["test"], args.val_size, group_ratios)
+#     if args.val_size != -1:
+#         print(f"Using only {args.val_size} samples of val data")
+#         if args.balance_val:
+#             print("Using balanced group ratios for validation set")
+#             group_ratios = np.array([1 / 4] * 4)
+#         else:
+#             print("Using group ratios from train set for validation set")
+#             group_ratios = trainset.group_counts / trainset.group_counts.sum()
+#             group_ratios = group_ratios / group_ratios.sum()
+#         data.subsample_to_size_and_ratio(holdoutsets["val"], args.val_size, group_ratios)
+#         # data.subsample_to_size_and_ratio(holdoutsets["test"], args.val_size, group_ratios)
 
-    # collate_fn = data.get_collate_fn(mixup=False, num_classes=trainset.n_classes)
-    loader_kwargs = {'batch_size': args.batch_size, 'num_workers': 16, 'pin_memory': True}
-    # sampler = data.get_sampler(trainset, args)
-    # train_loader = DataLoader(trainset, shuffle=True, sampler=sampler, collate_fn=collate_fn,
-    #                           **loader_kwargs)
-    train_loader = DataLoader(trainset, shuffle=True, **loader_kwargs)
-    holdout_loaders = {}
-    for name, ds in holdoutsets.items():
-        shuffle = True if (name == "val" and finetune_on_val) else False
-        # shuffle = True if (name == "test" and finetune_on_val) else False
-        holdout_loaders[name] = DataLoader(ds, shuffle=shuffle, **loader_kwargs)
-    return train_loader, holdout_loaders
-    # new_holdout_loaders = {}
-    # new_holdout_loaders["val"] = holdout_loaders["test"]
-    # new_holdout_loaders["test"] = holdout_loaders["val"]
-    # return train_loader, new_holdout_loaders
+#     # collate_fn = data.get_collate_fn(mixup=False, num_classes=trainset.n_classes)
+#     loader_kwargs = {'batch_size': args.batch_size, 'num_workers': 16, 'pin_memory': True}
+#     # sampler = data.get_sampler(trainset, args)
+#     # train_loader = DataLoader(trainset, shuffle=True, sampler=sampler, collate_fn=collate_fn,
+#     #                           **loader_kwargs)
+#     train_loader = DataLoader(trainset, shuffle=True, **loader_kwargs)
+#     holdout_loaders = {}
+#     for name, ds in holdoutsets.items():
+#         shuffle = True if (name == "val" and finetune_on_val) else False
+#         # shuffle = True if (name == "test" and finetune_on_val) else False
+#         holdout_loaders[name] = DataLoader(ds, shuffle=shuffle, **loader_kwargs)
+#     return train_loader, holdout_loaders
+#     # new_holdout_loaders = {}
+#     # new_holdout_loaders["val"] = holdout_loaders["test"]
+#     # new_holdout_loaders["test"] = holdout_loaders["val"]
+#     # return train_loader, new_holdout_loaders
 
 
 def get_data_phases(args, finetune_on_val=True):

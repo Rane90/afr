@@ -4,19 +4,19 @@ import torch
 import models
 import optimizers
 import losses
-from losses import get_exp_weights
 import utils
-from utils.common_utils import get_embeddings_args
-from utils.common_utils import set_seed
-from utils.common_utils import get_embeddings_loader
-from utils.supervised_utils import get_classifier_and_feature_extractor
-from utils.supervised_utils import take_step
-from utils.supervised_utils import get_last_layer_model
-from utils.supervised_utils import rebalance_weights
-from utils.supervised_utils import normalize_weights
-from utils.supervised_utils import EmbeddingManager
+from losses import get_exp_weights
+from utils.common_utils import (
+    get_embeddings_args, set_seed, get_embeddings_loader
+)
+from utils.supervised_utils import (
+    get_classifier_and_feature_extractor, take_step, get_last_layer_model,
+    rebalance_weights, normalize_weights, EmbeddingManager
+)
 from utils.logging import EmbeddingsLogger
 from utils.general import print_time_taken
+from models import get_model
+from data.datasets import get_dataset
 
 
 def train_embeddings(args):
@@ -30,34 +30,60 @@ def train_embeddings(args):
     Log.log_data_stats(train_loader, holdout_loaders['test'], holdout_loaders['val'])
 
     resume_ckpt = os.path.join(args.base_model_dir, args.checkpoint)
-    model = getattr(models, args.model)(holdout_loaders["val"].dataset.n_classes).to(device)
+
+    if args.use_mil:
+        Log.logger.info("🔍 Using MILAttentionModel with masked segments")
+        feature_extractor = getattr(models, 'imagenet_resnet50_pretrained')(holdout_loaders["val"].dataset.n_classes).to(device)
+        model = get_model(
+            args.model,
+            device=device,
+            feature_extractor=feature_extractor,
+            feature_dim=2048,
+            num_classes=holdout_loaders["val"].dataset.n_classes,
+            include_original=args.include_original
+        )
+        classifier = model.classifier
+    else:
+        Log.logger.info("🧠 Using standard classifier")
+        model = getattr(models, args.model)(holdout_loaders["val"].dataset.n_classes).to(device)
+        classifier, feature_extractor = get_classifier_and_feature_extractor(model)
+
+    # Resume weights
     aux = torch.load(resume_ckpt, map_location=device)
     if isinstance(aux, dict):
         model.load_state_dict(aux)
     else:
         model = aux
+
     model.eval()
     Log.logger.info(f'Model has {utils.count_parameters(model) / 1e6:.2g}M parameters')
 
-    classifier, feature_extractor = get_classifier_and_feature_extractor(model)
     Embedder = EmbeddingManager(device, args)
     loaders = (train_loader, holdout_loaders)
-    all_out = Embedder.get_train_test_embeddings(classifier, feature_extractor, loaders)
+
+    if args.use_mil:
+        all_out = Embedder.get_train_test_embeddings(model, None, loaders)
+    else:
+        all_out = Embedder.get_train_test_embeddings(classifier, feature_extractor, loaders)
+
     out, out_test, out_val = all_out
+    embeddings, _, groups, y = out
     test_embeddings, _, test_groups, test_y = out_test
     val_embeddings, _, val_groups, val_y = out_val
-    embeddings, _, groups, y = out
+
     logits = classifier(embeddings).detach()
     weights = get_exp_weights(logits, y, gamma=args.gamma)
     if args.rebalance_weights:
         weights = rebalance_weights(weights, y)
     weights = normalize_weights(weights)
+
     loader = get_embeddings_loader(args.emb_batch_size, embeddings, y, weights)
     init_weights = (classifier.weight.detach().clone(), classifier.bias.detach().clone())
     Log.log_group_weights(weights, groups, epoch=0)
 
     logits_test = classifier(test_embeddings)
     _ = Log.generate_acc_groups(logits_test, test_y, test_groups, epoch=0, partition="test")
+
     Log.save_holdout_data(test_data=(test_embeddings, test_y, test_groups),
                           val_data=(val_embeddings, val_y, val_groups))
 
@@ -70,15 +96,18 @@ def train_embeddings(args):
     for epoch in range(args.num_epochs):
         all_logits = []
         for ds in loader:
-            loss, logits = take_step(last_layer, ds, optimizer, criterion, scheduler, init_weights,
-                                     args.reg_coeff, max_norm=args.grad_norm)
+            loss, logits = take_step(
+                last_layer, ds, optimizer, criterion,
+                scheduler, init_weights, args.reg_coeff,
+                max_norm=args.grad_norm
+            )
             all_logits.append(logits)
-        logits = torch.concat(all_logits, dim=0)
-        if epoch > -1:
-            Log.logger.info(f"\nE: {epoch} | L: {loss:1.5e} ")
-            _ = Log.generate_acc_groups(logits, y, groups, epoch + 1, "train")
-            holdout_logits = (last_layer(test_embeddings), last_layer(val_embeddings))
-            Log.log_results_save_chkp(epoch + 1, holdout_logits, model=last_layer)
+        logits = torch.cat(all_logits, dim=0)
+
+        Log.logger.info(f"\nE: {epoch} | L: {loss:1.5e} ")
+        _ = Log.generate_acc_groups(logits, y, groups, epoch + 1, "train")
+        holdout_logits = (last_layer(test_embeddings), last_layer(val_embeddings))
+        Log.log_results_save_chkp(epoch + 1, holdout_logits, model=last_layer)
 
     Log.finalize_logging(last_layer)
     Log.save_plot("./logs/")

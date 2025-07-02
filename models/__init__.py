@@ -4,6 +4,16 @@ import types
 import timm
 from .preresnet import PreResNet
 from .model_utils import _replace_fc
+from models.mil_model import MILAttentionModel
+
+def get_model(name, device='cuda', **kwargs):
+    if name == 'MILAttentionModel':
+        return MILAttentionModel(
+            feature_extractor=kwargs['feature_extractor'],
+            feature_dim=kwargs['feature_dim'],
+            num_classes=kwargs.get("num_classes", 2),
+            integrate_original=kwargs.get("include_original", True),
+        ).to(device)
 
 
 def domino_preresnet20(output_dim):

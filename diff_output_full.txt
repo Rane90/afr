@@ -1,0 +1,3546 @@
+diff --git data/datasets.py data/datasets.py
+index 41c588f..334bfb3 100644
+--- data/datasets.py
++++ data/datasets.py
+@@ -1,893 +1,1073 @@
+ import os
+ import random
+ import numpy as np
+ import pandas as pd
+ import torch
+ from PIL import Image
+ from torch.utils.data import Dataset
+ from torchvision.datasets import CIFAR10
+ from torchvision.datasets import MNIST
+ from torchvision.datasets import ImageFolder
+ from torchvision.transforms import ToTensor
+ from typing import Callable, cast, Tuple
+ import wilds
+-
++from pathlib import Path
++from torchvision import transforms
++import torchvision.transforms.functional as TF
++from scipy.ndimage import distance_transform_edt
++import json
+ 
+ def _bincount_array_as_tensor(arr):
+     return torch.from_numpy(np.bincount(arr)).long()
+ 
+ 
+ def _randomly_split_in_two(samples, prop=0.8, seed=21, max_prop=1.0):
+     random.seed(seed)
+     random.shuffle(samples)
+     samples = samples[:int(len(samples) * max_prop)]
+     first_total = int(len(samples) * np.abs(prop))
+     if prop >= 0:
+         return samples[:first_total]
+     else:
+         return samples[-first_total:]
+ 
+ 
+ def get_group_array(y_array, spurious_array, all_groups):
+     group_array = np.zeros(y_array.shape[0], dtype=np.int64)
+     for idx, (y, ss) in enumerate(all_groups):
+         mask1 = np.array(spurious_array == ss)
+         mask2 = np.array(y_array == y)
+         mask = np.logical_and(mask1, mask2)
+         group_array[mask] = idx
+     return group_array
+ 
+ 
+ def _get_split(split):
+     try:
+         return ["train", "val", "test"].index(split)
+     except ValueError:
+         raise (f"Unknown split {split}")
+ 
+ 
+ def _cast_int(arr):
+     if isinstance(arr, np.ndarray):
+         return arr.astype(int)
+     elif isinstance(arr, torch.Tensor):
+         return arr.int()
+     else:
+         raise NotImplementedError
+ 
+ 
+ class SpuriousDataset(Dataset):
+     def __init__(self, basedir, split="train", transform=None, prop=1.0, seed=21, max_prop=1.0):
+         self.basedir = basedir
+         self.transform = transform
+ 
+         self.metadata_df = self._get_metadata(split)
+         indices = np.arange(len(self.metadata_df))
+         ind = _randomly_split_in_two(indices, prop=prop, seed=seed, max_prop=max_prop)
+         self.metadata_df = self.metadata_df.iloc[np.sort(ind)]
+ 
+         self.y_array = self.metadata_df["y"].values
+         self.spurious_array = self.metadata_df["place"].values
+         self._count_attributes()
+         self._get_class_spurious_groups()
+         self._count_groups()
+         self.filename_array = self.metadata_df["img_filename"].values
+ 
+     def _get_metadata(self, split):
+         split_i = _get_split(split)
+         metadata_df = pd.read_csv(os.path.join(self.basedir, "metadata.csv"))
+         metadata_df = metadata_df[metadata_df["split"] == split_i]
+         return metadata_df
+ 
+     def _count_attributes(self):
+         self.n_classes = np.unique(self.y_array).size
+         self.n_spurious = np.unique(self.spurious_array).size
+         self.y_counts = _bincount_array_as_tensor(self.y_array)
+         self.spurious_counts = _bincount_array_as_tensor(self.spurious_array)
+ 
+     def _count_groups(self):
+         self.group_counts = _bincount_array_as_tensor(self.group_array)
+         self.n_groups = len(self.group_counts)
+         self.active_groups = np.unique(self.group_array).tolist()
+ 
+     def _get_class_spurious_groups(self):
+         self.group_array = _cast_int(self.y_array * self.n_spurious + self.spurious_array)
+ 
+     def __len__(self):
+         return len(self.metadata_df)
+ 
+     def __getitem__(self, idx):
+         y = self.y_array[idx]
+         group = self.group_array[idx]
+         is_spurious = self.spurious_array[idx]
+         x = self._image_getitem(idx)
+         file_path = self.filename_array[idx]
+         return x, y, group, is_spurious, file_path
+ 
+     def _image_getitem(self, idx):
+         img_path = os.path.join(self.basedir, self.filename_array[idx])
+         img = Image.open(img_path).convert("RGB")
+         if self.transform:
+             img = self.transform(img)
+         return img
+ 
+ 
+ class JTTSpuriousDataset(SpuriousDataset):
+     def __init__(self, basedir, subset, upweight, split="train", transform=None, prop=1.,
+                  max_prop=1.):
+         del prop
+         del max_prop
+         selected_cols = ["img_filename", "y", "split", "place"]
+         self.basedir = basedir
+         self.metadata_df = self._get_metadata(split)
+         mistakes = pd.DataFrame({"img": subset * int(upweight - 1)})
+         aux = pd.merge(left=self.metadata_df, right=mistakes, left_on="img_filename",
+                        right_on="img")
+         self.metadata_df = pd.concat((self.metadata_df[selected_cols], aux[selected_cols]))
+         self.transform = transform
+         self.y_array = self.metadata_df["y"].values
+         self.spurious_array = self.metadata_df["place"].values
+         self._count_attributes()
+         self._get_class_spurious_groups()
+         self._count_groups()
+         self.filename_array = self.metadata_df["img_filename"].values
+ 
+ 
+ class ShrinkedSpuriousDataset(SpuriousDataset):
+     def __init__(self, basedir, subset, split="train", transform=None):
+         self.basedir = basedir
+         self.metadata_df = self._get_metadata(split)
+         subset = subset.reset_index()
+         subset = subset.rename(columns={"index": "img", 0: "group", 1: "focal"})
+         aux = pd.merge(left=self.metadata_df, right=subset, left_on="img_filename", right_on="img")
+         self.metadata_df = aux[["img_filename", "y", "split", "place"]]
+         self.transform = transform
+         self.y_array = self.metadata_df["y"].values
+         self.spurious_array = self.metadata_df["place"].values
+         self._count_attributes()
+         self._get_class_spurious_groups()
+         self._count_groups()
+         self.filename_array = self.metadata_df["img_filename"].values
+ 
+ 
+ class PhasesDataset(SpuriousDataset):
+     def __init__(self, basedir, split="train", transform=None):
+         super().__init__(basedir, split, transform)
+ 
+     def __getitem__(self, idx):
+         file_path = self.filename_array[idx]
+         label = self.y_array[idx]
+         group = self.group_array[idx]
+         is_spurious = self.spurious_array[idx]
+         image = self._image_getitem(idx)
+         return file_path, image, label, group, is_spurious
+ 
+ 
+ class MultiNLIDataset(SpuriousDataset):
+     """Adapted from https://github.com/kohpangwei/group_DRO/blob/master/data/multinli_dataset.py
+     """
+     def __init__(self, basedir, split="train", transform=None):
+         assert transform is None, "transfrom should be None"
+ 
+         # utils_glue module in basedir is needed to load data
+         import sys
+         sys.path.append(basedir)
+ 
+         self.basedir = basedir
+         self.metadata_df = pd.read_csv(os.path.join(self.basedir, "metadata_random.csv"))
+         bert_filenames = [
+             "cached_train_bert-base-uncased_128_mnli", "cached_dev_bert-base-uncased_128_mnli",
+             "cached_dev_bert-base-uncased_128_mnli-mm"
+         ]
+         features_array = sum(
+             [torch.load(os.path.join(self.basedir, name)) for name in bert_filenames], start=[])
+         all_input_ids = torch.tensor([f.input_ids for f in features_array]).long()
+         all_input_masks = torch.tensor([f.input_mask for f in features_array]).long()
+         all_segment_ids = torch.tensor([f.segment_ids for f in features_array]).long()
+         # all_label_ids = torch.tensor([
+         #     f.label_id for f in self.features_array]).long()
+ 
+         split_i = _get_split(split)
+         split_mask = (self.metadata_df["split"] == split_i).values
+ 
+         self.x_array = torch.stack((all_input_ids, all_input_masks, all_segment_ids),
+                                    dim=2)[split_mask]
+         self.metadata_df = self.metadata_df[split_mask]
+         self.y_array = self.metadata_df['gold_label'].values
+         self.spurious_array = (self.metadata_df['sentence2_has_negation'].values)
+         self._count_attributes()
+         self._get_class_spurious_groups()
+         self._count_groups()
+ 
+     def __getitem__(self, idx):
+         y = self.y_array[idx]
+         g = self.group_array[idx]
+         s = self.spurious_array[idx]
+         x = self.x_array[idx]
+         return x, y, g, s
+ 
+ 
+ class EmbeddingsDataset:
+     def __init__(self, embeddings, targets, weights):
+         self.embeddings = embeddings
+         self.targets = targets
+         self.weights = weights
+ 
+     def __len__(self):
+         return len(self.targets)
+ 
+     def __getitem__(self, idx):
+         emb = self.embeddings[idx]
+         y = self.targets[idx]
+         w = self.weights[idx]
+         return emb, y, w
+ 
+ 
+ class CirclesData(SpuriousDataset):
+     def __init__(self, basedir, split="train", transform=None, prop=1.0, seed=21, max_prop=1.0):
+         x, y = prepare_circles(basedir, prop=prop, split=split)
+         self.transform = transform
+         self.y_array = y
+         self.x = x
+ 
+         self.group_array = y
+         self.n_spurious = 4
+         self.n_classes = 4
+         self.n_groups = 4
+         self.group_counts = _bincount_array_as_tensor(self.group_array)
+         self.active_groups = list(range(self.n_groups))
+ 
+     def __len__(self):
+         return len(self.y_array)
+ 
+     def __getitem__(self, idx):
+         y = self.y_array[idx]
+         group = y
+         is_spurious = y
+         x = self.x[idx]
+         file_path = ""
+         return x, y, group, is_spurious, file_path
+ 
+ 
+ class BaseWildsDataset(SpuriousDataset):
+     def __init__(self, ds_name, basedir, split, transform, y_name, spurious_name, prop, seed=21):
+         self.basedir = basedir
+         self.root_dir = "/".join(self.basedir.split("/")[:-1])
+         base_dataset = wilds.get_dataset(dataset=ds_name, download=False, root_dir=self.root_dir)
+         self.dataset = base_dataset.get_subset(split, transform=transform)
+         if np.abs(prop) < 1.0:
+             ind = _randomly_split_in_two(np.arange(len(self.dataset)), prop=prop, seed=seed)
+             # self.dataset = WILDSSubset(self.dataset, indices=ind, transform=transform)
+             self.dataset.indices = self.dataset.indices[ind]
+             # self.dataset.metadata_array =  self.dataset.metadata_array[ind]
+ 
+         column_names = self.dataset.metadata_fields
+         if y_name:
+             y_idx = column_names.index(y_name)
+             self.y_array = self.dataset.metadata_array[:, y_idx]
+         if spurious_name:
+             s_idx = column_names.index(spurious_name)
+             self.spurious_idx = s_idx
+             self.spurious_array = self.dataset.metadata_array[:, s_idx]
+         if y_name and spurious_name:
+             self._count_attributes()
+ 
+     def __getitem__(self, idx):
+         x, y, metadata = self.dataset[idx]
+         s = metadata[self.spurious_idx]
+         g = self.group_array[idx]
+         return x, y, g, s, "img"
+ 
+     def __len__(self):
+         return len(self.dataset)
+ 
+ 
+ class Camelyon17(BaseWildsDataset):
+     def __init__(self, basedir, split, transform, prop=1.0, seed=21, **kwargs):
+         super().__init__(ds_name="camelyon17", basedir=basedir, split=split, transform=transform,
+                          y_name="y", spurious_name="slide", prop=prop, seed=seed)
+         self.n_spurious = 50
+         # all_groups = [(y, ss) for y in [0, 1] for ss in range(self.n_spurious)]
+         # self.group_array = _get_group_array(self.y_array, self.spurious_array, all_groups)
+         self.group_array = self.spurious_array
+         self._count_groups()
+ 
+ 
+ class WildsFMOW(BaseWildsDataset):
+     def __init__(self, basedir, split="train", transform=None):
+         super().__init__("fmow", basedir, split, transform, "y", "region")
+         self.group_array = self.spurious_array
+         self._count_groups()
+ 
+ 
+ class WildsPoverty(BaseWildsDataset):
+     def __init__(self, basedir, split="train", transform=None):
+         # assert transform is None, "transfrom should be None"
+         super().__init__("poverty", basedir, split, transform, "y", "urban")
+         self.n_classes = None
+         self.group_array = self.spurious_array
+         self._count_groups()
+ 
+ 
+ class WildsCivilCommentsCoarse(BaseWildsDataset):
+     def __init__(self, basedir, split="train", transform=None):
+         super().__init__("civilcomments", basedir, split, transform, "y", None)
+         attributes = [
+             "male", "female", "LGBTQ", "black", "white", "christian", "muslim", "other_religions"
+         ]
+         column_names = self.dataset.metadata_fields
+         self.spurious_cols = [column_names.index(a) for a in attributes]
+         self.spurious_array = self.get_spurious(self.dataset.metadata_array)
+         self._count_attributes()
+         self._get_class_spurious_groups()
+         self._count_groups()
+ 
+     def get_spurious(self, metadata):
+         if len(metadata.shape) == 1:
+             return metadata[self.spurious_cols].sum(-1).clip(max=1)
+         else:
+             return metadata[:, self.spurious_cols].sum(-1).clip(max=1)
+ 
+     def __getitem__(self, idx):
+         x, y, metadata = self.dataset[idx]
+         s = self.get_spurious(metadata)
+         g = y * self.n_spurious + s
+         return x, y, g, s
+ 
+ 
+ class DummyMNIST(SpuriousDataset):
+     def __init__(self, basedir, split="train", transform=None, spurious_correlation=0.90, **_):
+         del basedir, split, transform
+         self.spurious_correlation = spurious_correlation
+         size_n = 50
+         self.images = torch.randn(size=(size_n, 3, 28, 28))
+         self.targets = torch.randint(low=0, high=1, size=(size_n, ))
+         self.group, self.spurious = self.targets.clone(), self.targets.clone()
+         self.n_classes, self.n_spurious, self.n_groups = 2, 1, 4
+         self.group_array = np.array([0, 0, 0, 0, 1, 3, 3, 3, 2])
+         self.group_counts = _bincount_array_as_tensor(self.group_array)
+ 
+     def __len__(self):
+         return self.images.shape[0]
+ 
+     def __getitem__(self, idx):
+         image, label = self.images[idx], self.targets[idx]
+         group, spurious = self.group[idx], self.spurious[idx]
+         return image, label, group, spurious
+ 
+ 
+ class MultiColoredMNIST(SpuriousDataset):
+     def __init__(self, basedir, spurious_correlation, split="train", transform=None, seed=21,
+                  prop=1.0, max_prop=1.0):
+         use_train = True if split in ["train", "val"] else False
+         transform = ToTensor()
+         self.ds = MNIST(root=basedir, train=use_train, download=True, transform=transform)
+         self.subset_data_based_on_split(split)
+         data = (self.ds.data, self.ds.targets)
+         if split in ["train", "val", "test"]:
+             out = self.add_spurious_correlation(data, spurious_correlation=spurious_correlation)
+         else:
+             out = self.add_spurious_correlation(data, spurious_correlation=0.)
+         self.images, self.targets, self.group, self.is_spurious = out
+         indices = np.arange(len(self.images))
+         ind = _randomly_split_in_two(indices, prop=prop, seed=seed, max_prop=max_prop)
+         self.images = self.images[ind]
+         self.targets = self.targets[ind]
+         self.group = self.group[ind]
+         self.is_spurious = self.is_spurious[ind]
+         # self.flip_label(per=0.25)
+         # self.create_minority(trim_pc=0.05, class_to_trim=0)
+ 
+         self.data_size = self.images.shape[0]
+         self.n_spurious = 2
+         self.n_classes = len(torch.unique(self.targets))
+         # self.n_groups = len(torch.unique(self.group))
+         self.n_groups = len(self.group.unique())
+         self.active_groups = list(range(self.n_groups))
+         self.group_array = self.group.float()
+         self.group_counts = _bincount_array_as_tensor(self.group_array)
+ 
+     def flip_label(self, per):
+         n_classes = len(torch.unique(self.targets))
+         flip_label = torch.rand(self.targets.shape[0]) < per
+         pseudo_labels = torch.randint(low=0, high=n_classes, size=(self.targets.shape[0], ))
+         self.targets = torch.where(flip_label, pseudo_labels, self.targets)
+ 
+     def create_minority(self, trim_pc, class_to_trim):
+         mask = self.targets == class_to_trim
+         ind_trim = torch.masked_select(torch.arange(len(mask)), mask)
+         ind_other = torch.masked_select(torch.arange(len(mask)), torch.logical_not(mask))
+         selected_n = int(len(ind_trim) * trim_pc)
+         ind = torch.concat([ind_trim[:selected_n], ind_other])
+         ind, _ = torch.sort(ind)
+         self.images = self.images[ind]
+         self.targets = self.targets[ind]
+         self.group = self.group[ind]
+         self.is_spurious = self.is_spurious[ind]
+ 
+     def subset_data_based_on_split(self, split):
+         train_size = 48_000
+         if split == "train":
+             self.ds.data = self.ds.data[:train_size, :, :]
+             self.ds.targets = self.ds.targets[:train_size]
+         elif split == "val":
+             self.ds.data = self.ds.data[train_size:, :, :]
+             self.ds.targets = self.ds.targets[train_size:]
+ 
+     def add_spurious_correlation(self, data, spurious_correlation):
+         self.cases = [(0, 1), (2, 3), (4, 5), (6, 7), (8, 9)]
+         colors = self.get_colors()
+         images, targets = data[0], data[1]
+         colored_images, labels, spurious, group = self.prepare_placeholders(images, targets)
+         for idx in range(images.shape[0]):
+             spurious[idx] = torch.rand(1) < spurious_correlation
+             labels[idx] = self.get_label(targets[idx])
+             color_num = self.get_color_label(labels[idx], torch.logical_not(spurious[idx]))
+             group[idx] = self.determine_group(labels[idx], spurious[idx])
+             aux = torch.broadcast_to(images[idx], size=(3, 28, 28)).clone().float()
+             colored_images[idx] = aux.clone()
+             colored_images[idx] /= 256.
+             color = colors[int(color_num)]
+             for j in range(len(color)):
+                 colored_images[idx, j, :, :] *= color[j]
+         return colored_images, labels.long(), group.long(), spurious.long()
+ 
+     @staticmethod
+     def prepare_placeholders(images, targets):
+         colored_images = torch.zeros(size=(images.shape[0], 3, 28, 28))
+         labels = torch.zeros(size=(targets.shape[0], ))
+         spurious = torch.zeros(size=(targets.shape[0], )).bool()
+         group = torch.zeros(size=(targets.shape[0], ))
+         return colored_images, labels, spurious, group
+ 
+     def get_label(self, target):
+         target = int(target.clone().detach())
+         for idx, case in enumerate(self.cases):
+             lower, upper = case
+             if (target >= lower) and (target <= upper):
+                 label = torch.tensor(idx, dtype=torch.int64)
+         return label
+ 
+     def get_color_label(self, label, randomize_color):
+         color_label = torch.tensor(int(label), dtype=torch.int64)
+         if randomize_color:
+             # options = [idx for idx in range(len(self.cases)) if idx != int(label)]
+             options = [idx for idx in range(len(self.cases))]
+             selected = int(torch.randint(high=len(options), size=(1, )))
+             color_label = torch.tensor(options[selected], dtype=torch.int64)
+         return color_label
+ 
+     @staticmethod
+     def determine_group(label, spurious):
+         group = label.clone()
+         if spurious == 1:
+             group += 5
+         return torch.tensor(group, dtype=torch.int64)
+ 
+     @staticmethod
+     def get_colors():
+         purple = (127 / 256, 0., 255 / 256)
+         pink = (255 / 256, 0., 255 / 256)
+         blue = (0., 255 / 256, 255 / 256)
+         orange = (255 / 256, 128 / 256, 0.)
+         green = (128 / 256, 255 / 256, 0.)
+         colors = [purple, blue, pink, orange, green]
+         return colors
+ 
+     def __len__(self):
+         return self.data_size
+ 
+     def __getitem__(self, idx):
+         image, label = self.images[idx], self.targets[idx]
+         group, is_spurious = self.group[idx], self.is_spurious[idx]
+         return image, label, group, is_spurious
+ 
+ 
+ class FakeSpuriousCIFAR10(SpuriousDataset):
+     """CIFAR10 with SpuriousCorrelationDataset API.
+ 
+     Groups are the same as classes.
+     """
+     def __init__(self, basedir, split, transform=None, val_size=5000):
+         split_i = _get_split(split)
+         self.ds = CIFAR10(root=basedir, train=(split_i != 2), download=True, transform=transform)
+         if split_i == 0:
+             self.ds.data = self.ds.data[:-val_size]
+             self.ds.targets = self.ds.targets[:-val_size]
+         elif split_i == 1:
+             self.ds.data = self.ds.data[-val_size:]
+             self.ds.targets = self.ds.targets[-val_size:]
+ 
+         self.y_array = np.array(self.ds.targets)
+         self.n_classes = 10
+         self.spurious_array = np.zeros_like(self.y_array)
+         self.n_spurious = 1
+         self.group_array = self.y_array
+ 
+         self.n_groups = 10
+         self.group_counts = _bincount_array_as_tensor(self.group_array)
+         self.y_counts = _bincount_array_as_tensor(self.y_array)
+         self.spurious_counts = _bincount_array_as_tensor(self.spurious_array)
+ 
+     def __len__(self):
+         return len(self.ds)
+ 
+     def __getitem__(self, idx):
+         x, y = self.ds[idx]
+         return x, y, y, 0
+ 
+ 
+ class SpuriousCIFAR10(CIFAR10):
+     def __init__(self, basedir, split="train", transform=None, prop=1.0, seed=21, max_prop=1.0):
+         train = True if split == "train" else False
+         super().__init__(root=basedir, transform=transform, train=train)
+         ind = _randomly_split_in_two(np.arange(len(self.data)), prop=prop, seed=seed,
+                                      max_prop=max_prop)
+         self.data = self.data[ind]
+         self.targets = torch.tensor(self.targets)[ind]
+ 
+         self.add_spurious_attributes()
+ 
+     def add_spurious_attributes(self):
+         self.y_array = np.array(self.targets)
+         self.n_classes = 10
+         self.spurious_array = np.zeros_like(self.y_array)
+         self.n_spurious = 1
+         self.group_array = self.y_array
+ 
+         self.n_groups = 10
+         self.active_groups = [idx for idx in range(self.n_groups)]
+         self.group_counts = _bincount_array_as_tensor(self.group_array)
+         self.y_counts = _bincount_array_as_tensor(self.y_array)
+         self.spurious_counts = _bincount_array_as_tensor(self.spurious_array)
+ 
+     def __getitem__(self, index):
+         img, target = self.data[index], self.targets[index]
+         img = Image.fromarray(img)
+         if self.transform is not None:
+             img = self.transform(img)
+         dummy_spurious, dummy_path = 0, "img"
+         return img, target, target, dummy_spurious, dummy_path
+ 
+ 
+ class JTTSpuriousCIFAR10(SpuriousCIFAR10):
+     def __init__(self, basedir, subset, upweight, split="train", transform=None):
+         super().__init__(basedir, split, transform, prop=1.0, seed=21)
+         data_subset = self.data[subset]
+         data_subset = np.concatenate([data_subset for _ in range(upweight)], axis=0)
+         self.data = np.concatenate((self.data, data_subset), axis=0)
+ 
+         targets_subset = np.array(self.targets)[subset]
+         targets_subset = np.concatenate([targets_subset for _ in range(upweight)], axis=0)
+         self.targets = torch.tensor(np.concatenate((self.targets, targets_subset)))
+ 
+         self.add_spurious_attributes()
+ 
+ 
+ def remove_minority_groups(trainset, num_remove):
+     if num_remove == 0:
+         return
+     print("Removing minority groups")
+     print("Initial groups", np.bincount(trainset.group_array))
+     group_counts = trainset.group_counts
+     minority_groups = np.argsort(group_counts.numpy())[:num_remove]
+     minority_groups
+     idx = np.where(
+         np.logical_and.reduce([trainset.group_array != g for g in minority_groups],
+                               initial=True))[0]
+     trainset.y_array = trainset.y_array[idx]
+     trainset.group_array = trainset.group_array[idx]
+     trainset.confounder_array = trainset.confounder_array[idx]
+     trainset.filename_array = trainset.filename_array[idx]
+     trainset.metadata_df = trainset.metadata_df.iloc[idx]
+     print("Final groups", np.bincount(trainset.group_array))
+ 
+ 
+ def balance_groups(ds):
+     print("Original groups", ds.group_counts)
+     group_counts = ds.group_counts.long().numpy()
+     min_group = np.min(group_counts)
+     group_idx = [np.where(ds.group_array == g)[0] for g in range(ds.n_groups)]
+     for idx in group_idx:
+         np.random.shuffle(idx)
+     group_idx = [idx[:min_group] for idx in group_idx]
+     idx = np.concatenate(group_idx, axis=0)
+     ds.y_array = ds.y_array[idx]
+     ds.group_array = ds.group_array[idx]
+     ds.spurious_array = ds.spurious_array[idx]
+     ds.filename_array = ds.filename_array[idx]
+     ds.metadata_df = ds.metadata_df.iloc[idx]
+     ds.group_counts = torch.from_numpy(np.bincount(ds.group_array))
+     print("Final groups", ds.group_counts)
+ 
+ 
+ def unbalance_groups(ds, group_ratios):
+     # keep as much data as possible but with the given group ratios,
+     # assuming original groups roughly balanced scale ratios so that largest one is 1
+     group_ratios = np.array(group_ratios)
+     group_ratios = group_ratios / np.max(group_ratios)
+     print('Unbalancing groups with ratios', group_ratios)
+     print("Original groups", ds.group_counts)
+     group_counts = ds.group_counts.long().numpy()
+     min_group = np.min(group_counts)
+     group_idx = [np.where(ds.group_array == g)[0] for g in range(ds.n_groups)]
+     for idx in group_idx:
+         np.random.shuffle(idx)
+     group_idx = [idx[:int(min_group * r)] for idx, r in zip(group_idx, group_ratios)]
+     idx = np.concatenate(group_idx, axis=0)
+     ds.y_array = ds.y_array[idx]
+     ds.group_array = ds.group_array[idx]
+     ds.spurious_array = ds.spurious_array[idx]
+     ds.filename_array = ds.filename_array[idx]
+     ds.metadata_df = ds.metadata_df.iloc[idx]
+     ds.group_counts = torch.from_numpy(np.bincount(ds.group_array))
+     print("Final groups", ds.group_counts)
+ 
+ 
+ def subsample(ds, frac, generator=torch.Generator().manual_seed(42)):
+     subsample_size = int(len(ds) * frac)
+     idx = torch.randperm(len(ds), generator=generator).tolist()[:subsample_size]
+     ds.y_array = ds.y_array[idx]
+     ds.group_array = ds.group_array[idx]
+     ds.spurious_array = ds.spurious_array[idx]
+     ds.filename_array = ds.filename_array[idx]
+     ds.metadata_df = ds.metadata_df.iloc[idx]
+     ds.group_counts = torch.from_numpy(np.bincount(ds.group_array))
+ 
+ 
+ def subsample_to_size_and_ratio(ds, final_size, final_ratio):
+     # subsample ds so that the final dataset has final_size samples and
+     # final_ratio for each group where final_ratio sums to 1
+     final_ratio = np.array(final_ratio)
+     final_ratio = final_ratio / np.sum(final_ratio)
+     print(f'Subsampling to size {final_size} samples with ratios {final_ratio}')
+     print("Original groups", ds.group_counts)
+     group_counts = ds.group_counts.long().numpy()
+     check = (final_size * final_ratio <= group_counts).all()
+     assert check, 'Cannot subsample to desired size and ratio'
+     group_idx = [np.where(ds.group_array == g)[0] for g in range(ds.n_groups)]
+     group_idx = [idx[:int(final_size * r)] for idx, r in zip(group_idx, final_ratio)]
+     idx = np.concatenate(group_idx, axis=0)
+     ds.y_array = ds.y_array[idx]
+     ds.group_array = ds.group_array[idx]
+     ds.spurious_array = ds.spurious_array[idx]
+     ds.filename_array = ds.filename_array[idx]
+     ds.metadata_df = ds.metadata_df.iloc[idx]
+     ds.group_counts = torch.from_numpy(np.bincount(ds.group_array))
+     print("Final groups", ds.group_counts)
+ 
+ 
+ def subset(ds, idx):
+     ds.y_array = ds.y_array[idx]
+     ds.group_array = ds.group_array[idx]
+     ds.spurious_array = ds.spurious_array[idx]
+     ds.filename_array = ds.filename_array[idx]
+     ds.metadata_df = ds.metadata_df.iloc[idx]
+     ds.group_counts = torch.from_numpy(np.bincount(ds.group_array))
+ 
+ 
+ def concate(ds1, ds2):
+     ds1.y_array = np.concatenate((ds1.y_array, ds2.y_array), axis=0)
+     ds1.group_array = np.concatenate((ds1.group_array, ds2.group_array), axis=0)
+     ds1.spurious_array = np.concatenate((ds1.spurious_array, ds2.spurious_array), axis=0)
+     ds1.filename_array = np.concatenate((ds1.filename_array, ds2.filename_array), axis=0)
+     ds1.metadata_df = pd.concat((ds1.metadata_df, ds2.metadata_df), axis=0)
+     ds1.group_counts = torch.from_numpy(np.bincount(ds1.group_array))
+ 
+ 
+ class ChestXRay(ImageFolder):
+     def __init__(self, basedir, downsamples=None, split="train", transform=None, prop=1.0,
+                  max_prop=1.0):
+         self.prop = prop
+         self.max_prop = max_prop
+         if downsamples is None:
+             downsamples = (0.12, 1.0, 0.5, 0.5) if split == "train" else (1.0, 1.0, 1.0, 1.0)
+         self.split = "val" if split in ["test", "val"] else "train"
+         self.ds = downsamples
+         self.downsample_seed = 13
+         super().__init__(root=basedir, transform=transform)
+         self.split_dataset(split)
+         self.n_classes, self.n_spurious, self.n_groups = 2, 1, 4
+         self.group_array = np.array(list(map(lambda x: x[-1][1], self.samples)))
+         self.group_counts = _bincount_array_as_tensor(self.group_array)
+         self.active_groups = np.unique(self.group_array).tolist()
+ 
+     def split_dataset(self, split):
+         if split in ["test", "val"]:
+             # samples[1] = nihcxr/train/00021676_000.png
+             # samples[-1] = patient46237/study1/view1_frontal.jpg
+             s1 = _randomly_split_in_two(self.samples, prop=0.5)
+             s2 = _randomly_split_in_two(self.samples, prop=-0.5)
+             # samples[1] = patient48639/study2/view1_frontal.jpg
+             # samples[-1] = nihcxr/train/00003249_000.png
+             self.samples = s1 if split == "val" else s2
+ 
+         elif np.abs(self.prop) < 1.:
+             indices = np.arange(len(self.samples))
+             ind = _randomly_split_in_two(indices, self.prop, max_prop=self.max_prop)
+             self.samples = [self.samples[idx] for idx in ind]
+ 
+     @staticmethod
+     def _use_negative_label_policy(df):
+         df['Pneumonia'] = np.abs(df['Pneumonia'])
+         return df
+ 
+     def make_dataset(self, directory, class_to_idx, extensions=None, is_valid_file=None):
+         del class_to_idx
+ 
+         def is_valid_file(x: str) -> bool:
+             return x.lower().endswith(cast(Tuple[str, ...], extensions))
+ 
+         is_valid_file = cast(Callable[[str], bool], is_valid_file)
+ 
+         directory = os.path.expanduser(directory)
+         chexlabels = pd.read_csv(os.path.join(directory, 'chexpert/trainval.csv'))
+         # chexlabels.shape = (223,648, 19)
+         chexlabels = chexlabels[~np.isnan(chexlabels['Pneumonia'])]
+         # chexlabels.shape = (27,842, 19) !!
+         # chexlabels['Pneumonia'] = np.abs(chexlabels['Pneumonia'])
+         chexlabels = self._use_negative_label_policy(chexlabels)
+         # chexlabels['Pneumonia'].unique() = [0., -1., 1.]
+         # np.mean(mask = chexlabels['Pneumonia'] >= 0.) = 0.3258
+         # TODO: why abs? maybe a negative number signifies something
+         chexlabels.index = chexlabels['Path']
+ 
+         nihlabels = pd.read_csv(os.path.join(directory, 'nihcxr/nih_labels.csv'))
+         nihlabels.index = nihlabels['Image Index']
+ 
+         image_and_labels = []
+         np.random.seed(self.downsample_seed)
+ 
+         for root, _, fnames in os.walk(os.path.join(directory, 'nihcxr/train')):
+             for pic_name in fnames:
+                 label = nihlabels.loc[pic_name, 'Pneumonia']
+                 has_image_extension = is_valid_file(pic_name)
+                 is_in_correct_fold = nihlabels.loc[pic_name, 'fold'] == self.split
+                 if has_image_extension and is_in_correct_fold:
+                     cond1 = not label and np.random.rand() <= self.ds[0]
+                     cond2 = label and np.random.rand() <= self.ds[1]
+                     if (cond1) or (cond2):
+                         path = os.path.join(root, pic_name)
+                         group = 0 if label < 1 else 1
+                         image_and_labels.append((path, (int(label), group, -1)))
+ 
+         for root, _, fnames in os.walk(os.path.join(directory, f'chexpert/{self.split}')):
+             for pic_name in fnames:
+                 current_name = os.path.join(directory, f'chexpert/{self.split}')
+                 df_name = f'CheXpert-v1.0-small/{self.split}'
+                 pic_name = os.path.join(root.replace(current_name, df_name), pic_name)
+                 if pic_name in chexlabels.index:
+                     row = chexlabels.loc[pic_name]
+                     label = row['Pneumonia']
+                     has_image_extension = is_valid_file(pic_name)
+                     is_frontal = row['Frontal/Lateral'] == 'Frontal'
+                     if has_image_extension and is_frontal:
+                         cond1 = not label and np.random.rand() <= self.ds[2]
+                         cond2 = label and np.random.rand() <= self.ds[3]
+                         if (cond1) or (cond2):
+                             path = os.path.join(root, pic_name.split("/")[-1])
+                             group = 2 if label < 1 else 3
+                             image_and_labels.append((path, (int(label), group, -1)))
+         return image_and_labels
+ 
+     def __getitem__(self, index):
+         path, target = self.samples[index]
+         group, spurious = target[1], target[2]
+         target = target[0]
+         sample = self.loader(path)
+         if self.transform is not None:
+             sample = self.transform(sample)
+         if self.target_transform is not None:
+             target = self.target_transform(target)
+         return sample, target, group, spurious, path
+ 
+ 
+ class CXR(ChestXRay):
+     def __init__(self, basedir, downsamples=None, split="train", transform=None, prop=1.0,
+                  max_prop=1.0):
+         if downsamples is None:
+             downsamples = (0.12, 1.0, 1.0, 0.1) if split == "train" else (1.0, 1.0, 1.0, 1.0)
+         super().__init__(basedir, downsamples, split, transform, prop, max_prop)
+ 
+     @staticmethod
+     def _use_negative_label_policy(df):
+         mask = df['Pneumonia'] == -1
+         return df[np.logical_not(mask)]
+ 
+ 
+ class CXR2(ChestXRay):
+     def __init__(self, basedir, downsamples=None, split="train", transform=None, prop=1.0,
+                  max_prop=1.0):
+         if downsamples is None:
+             downsamples = (0.12, 1.0, 0.5, 0.5) if split == "train" else (1.0, 1.0, 1.0, 1.0)
+         super().__init__(basedir, downsamples, split, transform, prop, max_prop)
+ 
+ 
+ class JTTCXR(CXR):
+     def __init__(self, basedir, subset, upweight, split="train", transform=None, prop=1.0,
+                  max_prop=1.0, downsamples=None):
+         super().__init__(basedir, downsamples, split, transform, prop, max_prop)
+         subset_samples = []
+         for idx in subset:
+             for jdx in self.samples:
+                 if idx == jdx[0]:
+                     subset_samples.append(jdx)
+         subset_samples *= upweight
+         self.samples += subset_samples
+ 
+         self.n_classes, self.n_spurious, self.n_groups = 2, 1, 4
+         self.group_array = np.array(list(map(lambda x: x[-1][1], self.samples)))
+         self.group_counts = _bincount_array_as_tensor(self.group_array)
+         self.active_groups = np.unique(self.group_array).tolist()
+ 
+ 
+ def prepare_circles(file_path, prop, split, seed=21):
+     out = np.load(file_path)
+     x = torch.tensor(out["x"], dtype=torch.float32)
+     y = torch.tensor(out["y"], dtype=torch.float32)
+     train_n = int(x.shape[0] * prop)
+     ind = np.arange(x.shape[0])
+     np.random.seed(seed=seed)
+     np.random.shuffle(ind)
+     x_train, y_train = x[ind[:train_n]], y[ind[:train_n]]
+     x_test, y_test = x[ind[train_n:]], y[ind[train_n:]]
+     if split == "train":
+         return x_train, y_train
+     else:
+         return x_test, y_test
+ 
+ 
+ class DatasetGroup:
+     def __init__(self, data):
+         self.x, self.y = data
+ 
+     def __getitem__(self, index):
+         return self.x[index], int(self.y[index]), 0, 0
+ 
+     def __len__(self):
+         return self.x.shape[0]
+ 
+ 
+ def generate_multiple_circles_data(dataset_size, dim_n, proportions):
+     categories_n = len(proportions)
+     sizes = [int(dataset_size * prop) for prop in proportions]
+     sizes[-1] = dataset_size - sum(sizes[:-1])
+     ys, xs = [], []
+     lims = [(3 * i, 3 * (i + 1)) for i in range(categories_n)]
+     for idx, (lower, upper) in enumerate(lims):
+         x_i = np.zeros(shape=(sizes[idx], dim_n))
+         y_i = np.zeros(shape=(sizes[idx], ), dtype=np.int32)
+         radius = np.random.uniform(low=lower, high=upper, size=sizes[idx])
+         out = fill_in_cirle(x_i, radius, dim_n=dim_n)
+         xs.append(out)
+         ys.append(y_i + idx)
+ 
+     return np.concatenate(xs, axis=0), np.concatenate(ys, axis=0)
+ 
+ 
+ def fill_in_cirle(x, radius, dim_n):
+     for idx in range(x.shape[0]):
+         recurrent_sum = 0
+         r = radius[idx]
+         r2 = radius[idx]**2.
+         for cat in range(dim_n - 1):
+             if recurrent_sum > r2:
+                 break
+             x[idx, cat] = np.random.uniform(low=-r, high=np.sqrt(r2 - recurrent_sum))
+             recurrent_sum += x[idx, cat]**2.
+             sign = np.random.choice(a=[-1., 1.], size=1)[0]
+         out = sign * np.sqrt(r2 - recurrent_sum) if r2 >= recurrent_sum else 0.
+         x[idx, dim_n - 1] = out
+     return x
+ 
+ 
+ def fill_spurious(x, y, categories, alpha, spurious_dim, locs=(1., 0.), scales=(0.1, 10.0)):
+     spur_mean, noise_mean = locs
+     spur_std, noise_std = scales
+     mask = np.isin(y, categories)
+ 
+     spurious_loc = np.random.choice(a=2, size=(x.shape[0], 1), p=[alpha, 1 - alpha])
+     x_new = np.random.normal(loc=noise_mean, scale=noise_std, size=(x.shape[0], spurious_dim))
+     spur_feat = np.random.normal(loc=spur_mean, scale=spur_std, size=(x.shape[0], spurious_dim))
+     x_new[mask] = np.where(spurious_loc[mask] == 0, spur_feat[mask], x_new[mask])
+ 
+     x_new = np.concatenate((x, x_new), axis=1)
+     return x_new
++
++
++class MaskedBagWaterbirds(SpuriousDataset):
++    def __init__(
++        self,
++        basedir,
++        split="train",
++        transform=None,
++        masking_strategy="mean_fill_dilation",
++        max_distance=30.0,
++        alpha=0.1,
++        crop_scale=(0.85, 1.0),
++        bag_size=5,
++        include_original=True,
++        gradual_shrink=False,
++        current_epoch=0,
++        total_epochs=20,
++    ):
++        super().__init__(basedir, split=split, transform=transform)
++        self.split = split
++        self.root = Path(basedir)
++        self.include_original = include_original
++        self.masking_strategy = masking_strategy
++        self.max_distance = max_distance
++        self.alpha = alpha
++        self.crop_scale = crop_scale
++        self.gradual_shrink = gradual_shrink
++        self.current_epoch = current_epoch
++        self.total_epochs = total_epochs
++        self.bag_size = bag_size
++
++        # Load segment metadata
++        # Load everything from a single cached JSON file
++        cache_file = os.path.join(self.root, f"waterbirds_split_cache_{split}.json")
++        print(f"📖 Loading Waterbirds cache: {cache_file}")
++        with open(cache_file, "r") as f:
++            cache = json.load(f)
++
++        self.segments = cache["segments"]
++        self.mask_cache = {}  # batch file -> np.array
++        # self.cached_mask_files = cache["mask_files"]  # Optional, if needed
++
++        # Compose transform (used only if self.transform is None)
++        self.image_transform = transforms.Compose([
++            transforms.RandomResizedCrop(224, scale=self.crop_scale),
++            transforms.RandomHorizontalFlip(),
++            transforms.ColorJitter(0.25, 0.25, 0.25),
++            transforms.ToTensor()
++        ])
++
++    def _load_segments_json(self, json_path):
++        with open(json_path, "r") as f:
++            all_data = json.load(f)
++        segments = all_data["segments"]
++        assert len(segments) == len(self.filename_array), "Mismatch between segments and dataset length"
++        return segments
++
++    def __len__(self):
++        return len(self.filename_array)
++
++    def __getitem__(self, idx):
++        # Load image
++        file_name = self.filename_array[idx]
++        img_path = os.path.join(self.basedir, file_name)
++        image = Image.open(img_path).convert("RGB")
++
++        label = self.y_array[idx]
++        group = self.group_array[idx]
++        spurious = self.spurious_array[idx]
++
++        segment_list = self.segments[idx]
++
++        # Ensure exactly N segments
++        segment_list = self._pad_or_trim_segments(segment_list, self.bag_size)
++
++        # Load masks, concepts, clip scores
++        masks, concepts, clip_scores = [], [], []
++        for seg in segment_list:
++            batch_file = seg["batch_file"]
++            mask_index = seg["mask_index"]
++
++            if batch_file not in self.mask_cache:
++                self.mask_cache[batch_file] = np.load(self.root / batch_file)
++
++            mask_array = self.mask_cache[batch_file]
++            mask = mask_array[mask_index]
++            masks.append(torch.tensor(mask))
++            concepts.append(torch.tensor(seg["concepts"], dtype=torch.float32))
++            clip_scores.append(torch.tensor(seg["scores"], dtype=torch.float32))
++
++
++        # Apply image + mask transforms
++        original_tensor, masked_bag, _ = self._transform(image, masks)
++
++        if self.include_original:
++            masked_bag.insert(0, original_tensor)
++
++        return {
++            "bag": torch.stack(masked_bag),  # [P, C, H, W]
++            "label": label,
++            "clip_score": torch.stack(clip_scores),  # [P,]
++            "concepts": torch.stack(concepts),       # [P, num_concepts]
++            "group": group,
++            "spurious": spurious,
++            "filename": file_name,
++        }
++
++    def _pad_or_trim_segments(self, segs, target_len):
++        segs = list(segs)
++        if len(segs) >= target_len:
++            return segs[:target_len]
++        else:
++            # repeat entries to fill bag
++            repeat_count = target_len - len(segs)
++            return segs + [segs[i % len(segs)] for i in range(repeat_count)]
++
++    def _transform(self, img, masks):
++        i, j, h, w = transforms.RandomResizedCrop.get_params(img, scale=self.crop_scale, ratio=(1.0, 1.0))
++        img = TF.resized_crop(img, i, j, h, w, (224, 224))
++        if np.random.rand() < 0.5:
++            img = TF.hflip(img)
++            masks = [TF.hflip(TF.resized_crop(mask.unsqueeze(0), i, j, h, w, (224, 224))).squeeze(0) for mask in masks]
++        else:
++            masks = [TF.resized_crop(mask.unsqueeze(0), i, j, h, w, (224, 224)).squeeze(0) for mask in masks]
++
++        img = transforms.ColorJitter(0.25, 0.25, 0.25)(img)
++        img_tensor = TF.to_tensor(img)
++
++        raw_instances = [(mask > 0.5).float() * img_tensor for mask in masks]
++        masked_instances = [self._apply_masking_strategy(img_tensor, mask) for mask in masks]
++        return img_tensor, masked_instances, raw_instances
++
++    def _apply_masking_strategy(self, img_tensor, mask_tensor):
++        if self.masking_strategy != "mean_fill_dilation":
++            raise ValueError("Only 'mean_fill_dilation' masking is supported in this class.")
++
++        mask_np = mask_tensor.numpy()
++        mean_val = img_tensor.mean(dim=(1, 2), keepdim=True)
++
++        if self.gradual_shrink:
++            progress = min(self.current_epoch / self.total_epochs, 1.0)
++            max_dist = self.max_distance - (self.max_distance - 5.0) * progress
++        else:
++            max_dist = self.max_distance
++
++        dist = distance_transform_edt(1 - mask_np)
++        soft_mask_np = np.ones_like(dist)
++        soft_mask_np[dist > max_dist] = 0.0
++        soft_mask = torch.from_numpy(soft_mask_np).float()
++
++        return soft_mask * img_tensor + (1 - soft_mask) * mean_val
++
++def get_dataset(name, **kwargs):
++    if name == 'masked_bag_waterbirds':
++        return MaskedBagWaterbirds(
++            basedir=kwargs.pop("data_dir"),
++            split=kwargs.pop("split"),
++            transform=kwargs.pop("transform", None),
++            bag_size=kwargs.get("bag_size", 5),
++            masking_strategy=kwargs.get("masking_strategy", "mean_fill_dilation"),
++            max_distance=kwargs.get("max_distance", 30.0),
++            alpha=kwargs.get("alpha", 0.1),
++            crop_scale=kwargs.get("crop_scale", (0.85, 1.0)),
++            gradual_shrink=kwargs.get("gradual_shrink", False),
++            current_epoch=kwargs.get("current_epoch", 0),
++            total_epochs=kwargs.get("total_epochs", 20),
++            include_original=kwargs.get("include_original", True),
++        )
++    elif name == "SpuriousDataset":
++        # Normalize the keyword to 'basedir'
++        if "data_dir" in kwargs:
++            kwargs["basedir"] = kwargs.pop("data_dir")
++        return SpuriousDataset(**kwargs)
++    else:
++        raise ValueError(f"Unknown dataset name: {name}")
++
+diff --git models/__init__.py models/__init__.py
+index 75675ff..5758af4 100644
+--- models/__init__.py
++++ models/__init__.py
+@@ -1,99 +1,109 @@
+ import torch
+ import torchvision
+ import types
+ import timm
+ from .preresnet import PreResNet
+ from .model_utils import _replace_fc
++from models.mil_model import MILAttentionModel
++
++def get_model(name, device='cuda', **kwargs):
++    if name == 'MILAttentionModel':
++        return MILAttentionModel(
++            feature_extractor=kwargs['feature_extractor'],
++            feature_dim=kwargs['feature_dim'],
++            num_classes=kwargs.get("num_classes", 2),
++            integrate_original=kwargs.get("include_original", True),
++        ).to(device)
+ 
+ 
+ def domino_preresnet20(output_dim):
+     return _replace_fc(PreResNet(domino=True, depth=20), output_dim)
+ 
+ 
+ def cifar_preresnet20(output_dim):
+     return _replace_fc(PreResNet(domino=False, depth=20), output_dim)
+ 
+ 
+ def _base_resnet18_cifar():
+     model = torchvision.models.resnet18(pretrained=False)
+     model.conv1 = torch.nn.Conv2d(3, 64, 3, 1, 1, bias=False)
+     model.maxpool = torch.nn.Identity()
+     return model
+ 
+ 
+ def cifar_resnet18(output_dim):
+     model = _base_resnet18_cifar()
+     return _replace_fc(model, output_dim)
+ 
+ 
+ def domino_resnet18(output_dim):
+     model = _base_resnet18_cifar()
+     model = _replace_fc(model, output_dim)
+     return model
+ 
+ 
+ def simclr_cifar_resnet18_twolayerhead(output_dim):
+     hidden_dim = 2048
+     model = _base_resnet18_cifar()
+     d = model.fc.in_features
+     model.fc = torch.nn.Sequential(torch.nn.Linear(d, hidden_dim), torch.nn.ReLU(),
+                                    torch.nn.Linear(hidden_dim, output_dim))
+     model.fc.in_features = d
+ 
+     return model
+ 
+ 
+ def imagenet_resnet50(output_dim):
+     return _replace_fc(torchvision.models.resnet50(pretrained=False), output_dim)
+ 
+ 
+ def imagenet_resnet50_pretrained(output_dim):
+     return _replace_fc(torchvision.models.resnet50(pretrained=True), output_dim)
+ 
+ 
+ def imagenet_resnet50_timm(output_dim):
+     return _replace_fc(timm.create_model('resnet50', pretrained=True), output_dim)
+ 
+ 
+ def imagenet_resnet18_pretrained(output_dim):
+     return _replace_fc(torchvision.models.resnet18(pretrained=True), output_dim)
+ 
+ 
+ def imagenet_resnet34_pretrained(output_dim):
+     return _replace_fc(torchvision.models.resnet34(pretrained=True), output_dim)
+ 
+ 
+ def imagenet_resnet101_pretrained(output_dim):
+     return _replace_fc(torchvision.models.resnet101(pretrained=True), output_dim)
+ 
+ 
+ def imagenet_resnet152_pretrained(output_dim):
+     return _replace_fc(torchvision.models.resnet152(pretrained=True), output_dim)
+ 
+ 
+ def imagenet_wide_resnet50_2_pretrained(output_dim):
+     return _replace_fc(torchvision.models.wide_resnet50_2(pretrained=True), output_dim)
+ 
+ 
+ def imagenet_resnext50_32x4d_pretrained(output_dim):
+     return _replace_fc(torchvision.models.resnext50_32x4d(pretrained=True), output_dim)
+ 
+ 
+ def _densenet_replace_fc(model, output_dim):
+     model.fc = torch.nn.Identity()
+     model.fc.in_features = model.classifier.in_features
+     delattr(model, "classifier")
+ 
+     def classifier(self, x):
+         return self.fc(x)
+ 
+     model.classifier = types.MethodType(classifier, model)
+     return _replace_fc(model, output_dim)
+ 
+ 
+ def imagenet_densenet121_pretrained(output_dim):
+     return _densenet_replace_fc(torchvision.models.densenet121(pretrained=True), output_dim)
+ 
+ 
+ def imagenet_densenet121(output_dim):
+     return _densenet_replace_fc(torchvision.models.densenet121(pretrained=False), output_dim)
+diff --git notebooks/wb_celeba.ipynb notebooks/wb_celeba.ipynb
+index 410ddb7..64a6e0c 100644
+--- notebooks/wb_celeba.ipynb
++++ notebooks/wb_celeba.ipynb
+@@ -1,885 +1,955 @@
+ {
+  "cells": [
+   {
+    "cell_type": "code",
+-   "execution_count": null,
++   "execution_count": 6,
+    "metadata": {},
+    "outputs": [],
+    "source": [
+-    "%env CUDA_VISIBLE_DEVICES=0\n",
+-    "%env OMP_NUM_THREADS=4"
++    "# %env CUDA_VISIBLE_DEVICES=0\n",
++    "# %env OMP_NUM_THREADS=4"
+    ]
+   },
+   {
+    "cell_type": "code",
+-   "execution_count": null,
++   "execution_count": 7,
+    "metadata": {},
+    "outputs": [],
+    "source": [
+     "### TODO: Modify these to your own paths ###\n",
+-    "wb_data_path = '/datasets/waterbirds_official'\n",
+-    "celeba_data_path = '/datasets/CelebA'\n",
++    "wb_data_path = '/dsi/scratch/users/eisenbr2/waterbird_complete95_forest2water2/'\n",
++    "celeba_data_path = '/dsi/scratch/users/eisenbr2/celebA/'\n",
+     "\n",
+-    "CKPTDIR = '/home/shikai_q/spurious_old/checkpoints'\n",
++    "CKPTDIR = '/dsi/ofirlin-lab/eisenbr2/waterbirds/spurious_old/checkpoints'\n",
+     "\n",
+     "WB_CKPTS = [\n",
+     "    f\"{CKPTDIR}/wb/80_1/final_checkpoint.pt\", \n",
+     "    f\"{CKPTDIR}/wb/80_21/20230115_131136_mVno/final_checkpoint.pt\",\n",
+     "    f\"{CKPTDIR}/wb/80_98/20230115_131150_CThg/final_checkpoint.pt\"\n",
+     "]\n",
+     "CelebA_CKPTS = [\n",
+     "    f\"{CKPTDIR}/celeba/80_1/20230106_144116_tpaT/final_checkpoint.pt\", \n",
+     "    f\"{CKPTDIR}/celeba/80_21/20230106_144132_glNH/final_checkpoint.pt\",\n",
+     "    f\"{CKPTDIR}/celeba/80_98/20230106_144147_AVRm/final_checkpoint.pt\"\n",
+     "    ]\n",
+     "### The remaining code needs zero modification ###"
+    ]
+   },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [
++    {
++     "name": "stdout",
++     "output_type": "stream",
++     "text": [
++      "Requirement already satisfied: einops in /home/dsi/eisenbr2/anaconda3/envs/cbm/lib/python3.9/site-packages (0.8.1)\n"
++     ]
++    }
++   ],
++   "source": [
++    "# !pip install einops"
++   ]
++  },
+   {
+    "cell_type": "code",
+    "execution_count": null,
+    "metadata": {},
+    "outputs": [],
+    "source": [
++    "# # 1st stage\n",
++    "# CUDA_VISIBLE_DEVICES=3 python train_supervised.py --use_wandb --output_dir=logs/waterbirds/80_0 --project=waterbirds --seed=0 --eval_freq=10 --save_freq=10 --data_dir='/dsi/scratch/users/eisenbr2/waterbird_complete95_forest2water2' --dataset=SpuriousDataset --data_transform=AugWaterbirdsCelebATransform --model='imagenet_resnet50_pretrained' --max_prop=1.0 --train_prop=80 --num_epochs=50 --batch_size=32 --optimizer=sgd_optimizer --scheduler=constant_lr_scheduler --init_lr=0.003 --weight_decay=1e-4\n",
++    "# # 2nd stage\n",
++    "# CUDA_VISIBLE_DEVICES=3 python train_embeddings.py --use_wandb --output_dir=logs/waterbirds/emb --project=waterbirds --seed=0 --base_model_dir=logs/waterbirds/80_0 --model=imagenet_resnet50_pretrained --data_dir='/dsi/scratch/users/eisenbr2/waterbird_complete95_forest2water2' --data_transform=NoAugWaterbirdsCelebATransform --num_epochs=500 --batch_size=128 --emb_batch_size=-1 --optimizer=sgd_optimizer --scheduler=constant_lr_scheduler --init_lr=0.01 --momentum=0. --weight_decay=0. --loss=afr --tune_on=train --train_prop=-20 --gamma=10 --num_augs=1 --grad_norm=1.0 --reg_coeff=0.0"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": []
++  },
++  {
++   "cell_type": "code",
++   "execution_count": 9,
++   "metadata": {},
++   "outputs": [
++    {
++     "name": "stdout",
++     "output_type": "stream",
++     "text": [
++      "The autoreload extension is already loaded. To reload it, use:\n",
++      "  %reload_ext autoreload\n"
++     ]
++    }
++   ],
++   "source": [
++    "import os\n",
++    "os.environ[\"CUDA_VISIBLE_DEVICES\"] = \"3\"\n",
++    "os.environ[\"OMP_NUM_THREADS\"] = \"4\"\n",
+     "import torch\n",
+     "from types import SimpleNamespace\n",
+     "\n",
+     "import numpy as np\n",
+-    "import os\n",
++    "# import os\n",
+     "import sys\n",
+     "import tqdm\n",
+     "\n",
+     "# import from parent directory\n",
+     "sys.path.append(os.path.abspath(os.path.join(os.getcwd(), os.pardir)))\n",
+     "import models\n",
+     "import utils\n",
+     "\n",
+     "from matplotlib import pyplot as plt\n",
+     "%matplotlib inline\n",
+     "%load_ext autoreload\n",
+     "%autoreload 2"
+    ]
+   },
+   {
+    "cell_type": "code",
+-   "execution_count": null,
++   "execution_count": 10,
+    "metadata": {},
+    "outputs": [],
+    "source": [
+     "def extract_embeddings(ckpt, args, num_augs, load_emb=True, model_cls=models.imagenet_resnet50_pretrained):\n",
+     "    trian_group_ratios = np.array(utils.get_train_group_ratios(args))\n",
+     "    train_loader, holdout_loaders = utils.get_data(args, finetune_on_val=args.finetune_on_val)\n",
+     "    n_classes = train_loader.dataset.n_classes\n",
+     "\n",
+     "    model = model_cls(n_classes)\n",
+     "    model.load_state_dict(torch.load(ckpt))\n",
+     "    model.cuda(); model.eval();\n",
+     "\n",
+     "    classifier = model.fc\n",
+     "    w0 = classifier.weight.data.clone()\n",
+     "    b0 = classifier.bias.data.clone()\n",
+     "    model.fc = torch.nn.Identity()\n",
+     "    \n",
+     "    emb_path = f'{ckpt.replace(\".pt\", f\"_{args.data_transform}{num_augs}_embeddings.pt\")}'\n",
+     "    if not load_emb or not os.path.exists(emb_path):\n",
+     "        reweighting_embeddings, reweighting_predictions, reweighting_y, reweighting_groups = get_embeddings_predictions(model, classifier, train_loader, num_augs)\n",
+     "        val_embeddings, val_predictions, val_y, val_groups = get_embeddings_predictions(model, classifier, holdout_loaders['val'], num_augs=1)\n",
+     "        test_embeddings, test_predictions, test_y, test_groups = get_embeddings_predictions(model, classifier, holdout_loaders['test'], num_augs=1)\n",
+     "        emb_dict = dict(\n",
+     "                e=reweighting_embeddings, y=reweighting_y, pred=reweighting_predictions, g=reweighting_groups,\n",
+     "                test_e=test_embeddings, test_pred=test_predictions, test_y=test_y, test_g=test_groups,\n",
+     "                val_e=val_embeddings, val_pred=val_predictions, val_y=val_y, val_g=val_groups,\n",
+     "                w0=w0, b0=b0, trian_group_ratios=trian_group_ratios\n",
+     "            )\n",
+     "        torch.save(\n",
+     "            emb_dict,\n",
+     "            emb_path\n",
+     "        )\n",
+     "        print(f'Saved embeddings to {emb_path}')\n",
+     "    else:\n",
+     "        print(f'Loading embeddings from {emb_path}')\n",
+     "        emb_dict = torch.load(emb_path)\n",
+     "        reweighting_embeddings, reweighting_predictions, reweighting_y, reweighting_groups = emb_dict['e'], emb_dict['pred'], emb_dict['y'], emb_dict['g']\n",
+     "        test_embeddings, test_predictions, test_y, test_groups = emb_dict['test_e'], emb_dict['test_pred'], emb_dict['test_y'], emb_dict['test_g']\n",
+     "        val_embeddings, val_predictions, val_y, val_groups = emb_dict['val_e'], emb_dict['val_pred'], emb_dict['val_y'], emb_dict['val_g']\n",
+     "\n",
+     "    group_counts = {}\n",
+     "    for g in reweighting_groups:\n",
+     "            group_counts[g.item()] = group_counts.get(g.item(), 0) + 1\n",
+     "    print('*** Reweighting Counts + Group distribution: ***')\n",
+     "    for g in sorted(group_counts.keys()):\n",
+     "        print(f'Group {g}: {group_counts[g]} ({(group_counts[g] / sum(group_counts.values()) * 100):.1f}%)')\n",
+     "\n",
+     "    print('*** Reweighting Acc + Group distribution: ***')        \n",
+     "    print_accs(reweighting_predictions, reweighting_y, reweighting_groups)\n",
+     "\n",
+     "    print('*** Test Acc + Group distribution: ***')        \n",
+     "    print_accs(test_predictions, test_y, test_groups)\n",
+     "\n",
+     "    print('*** Val Acc + Group distribution: ***')\n",
+     "    print_accs(val_predictions, val_y, val_groups)\n",
+     "    # return reweighting_embeddings.cuda(), reweighting_y.cuda(), reweighting_groups.cuda(), test_embeddings.cuda(), test_y.cuda(), test_predictions.cuda(), test_groups.cuda(), \n",
+     "    emb_dict['trian_group_ratios'] = trian_group_ratios\n",
+     "    return emb_dict\n",
+     "\n",
+     "def get_embeddings_predictions(feature_extractor, classifier, loader, num_augs):\n",
+     "    all_embeddings, all_predictions, all_y_true, all_groups = [], [], [], []\n",
+     "    with torch.no_grad():\n",
+     "        for epoch in range(num_augs):\n",
+     "            for x, y_true, g, *_ in tqdm.tqdm(loader):\n",
+     "                x = x.cuda()\n",
+     "\n",
+     "                embeddings = feature_extractor(x)\n",
+     "                predictions = torch.argmax(classifier(embeddings), axis=1)\n",
+     "                all_embeddings.append(embeddings.cpu())\n",
+     "                all_predictions.append(predictions.cpu())\n",
+     "                all_y_true.append(y_true.cpu())\n",
+     "                all_groups.append(g.cpu())\n",
+     "    all_embeddings = torch.cat(all_embeddings, axis=0)\n",
+     "    all_predictions = torch.cat(all_predictions, axis=0)\n",
+     "    all_y_true = torch.cat(all_y_true, axis=0)\n",
+     "    all_groups = torch.cat(all_groups, axis=0)\n",
+     "    return all_embeddings, all_predictions, all_y_true, all_groups\n",
+     "\n",
+     "def get_accs(test_predictions, test_y, test_groups):\n",
+     "    return [(test_predictions == test_y)[test_groups == g].float().mean().item() for g in range(test_groups.max() + 1)]\n",
+     "\n",
+     "def print_accs(test_predictions, test_y, test_groups):\n",
+     "    acc = (test_predictions == test_y).float().mean()\n",
+     "    group_accs = get_accs(test_predictions, test_y, test_groups)\n",
+     "    group_counts = {}\n",
+     "    for g in test_groups:\n",
+     "            group_counts[g.item()] = group_counts.get(g.item(), 0) + 1\n",
+     "    print(f\"Avg: {acc:.3f}\")\n",
+     "    for g, acc in enumerate(group_accs):\n",
+     "        if g in group_counts:\n",
+     "            print(f\"Group {g}: {acc:.2f} ({(group_counts[g] / sum(group_counts.values()) * 100):.1f}%)\")\n",
+     "        else:\n",
+     "            print(f\"Group {g}: {acc:.2f} (0.0%)\")"
+    ]
+   },
+   {
+    "cell_type": "code",
+-   "execution_count": null,
++   "execution_count": 11,
+    "metadata": {},
+    "outputs": [],
+    "source": [
+     "def wxe_fn(logits, y, weights):\n",
+     "    ce = torch.nn.functional.cross_entropy(logits, y, reduction='none')\n",
+     "    l = weights * ce\n",
+     "    return l.sum()\n",
+     "\n",
+     "def compute_afr_weights(erm_logits, class_label, gamma, balance_classes):\n",
+     "    # erm_logits: (n_samples, n_classes)\n",
+     "    # class_label: (n_samples,)\n",
+     "    # gamma: float\n",
+     "    with torch.no_grad():\n",
+     "        p = erm_logits.softmax(-1)\n",
+     "        y_onehot = torch.zeros_like(erm_logits).scatter_(-1, class_label.unsqueeze(-1), 1)\n",
+     "        p_true = (p * y_onehot).sum(-1)\n",
+     "        weights = (-gamma * p_true).exp()\n",
+     "        n_classes = torch.unique(class_label).numel()\n",
+     "        # class balancing\n",
+     "        if balance_classes:\n",
+     "            class_count = []\n",
+     "            for y in range(n_classes):\n",
+     "                class_count.append((class_label == y).sum())\n",
+     "            for y in range(1, n_classes):\n",
+     "                weights[class_label == y] *= class_count[0] / class_count[y]\n",
+     "        weights /= weights.sum()\n",
+     "    return weights"
+    ]
+   },
+   {
+    "cell_type": "code",
+-   "execution_count": null,
++   "execution_count": 12,
+    "metadata": {},
+    "outputs": [],
+    "source": [
+     "def train(emb_dict, num_epochs, gamma, reg_coeff, lr=1e-2, balance_classes=False, early_stop='wga', plot=True, silent=False, group_uniform=False, opt='sgd'):\n",
+     "    reweighting_embeddings = emb_dict['e'].cuda()\n",
+     "    reweighting_y = emb_dict['y'].cuda()\n",
+     "    reweighting_groups = emb_dict['g'].cuda()\n",
+     "    test_embeddings = emb_dict['test_e'].cuda()\n",
+     "    test_y = emb_dict['test_y'].cuda()\n",
+     "    test_groups = emb_dict['test_g'].cuda()\n",
+     "    val_embeddings = emb_dict['val_e'].cuda()\n",
+     "    val_y = emb_dict['val_y'].cuda()\n",
+     "    val_groups = emb_dict['val_g'].cuda()\n",
+     "    w0 = emb_dict['w0'].cuda()\n",
+     "    b0 = emb_dict['b0'].cuda()\n",
+     "    trian_group_ratios = emb_dict['trian_group_ratios']\n",
+     "    num_groups = torch.unique(test_groups).numel()\n",
+     "\n",
+     "    class Model(torch.nn.Module):\n",
+     "        def __init__(self, w0, b0):\n",
+     "            super().__init__()\n",
+     "            self.w0 = w0\n",
+     "            self.b0 = b0\n",
+     "            self.linear = torch.nn.Linear(w0.shape[1], w0.shape[0], bias=True)\n",
+     "            \n",
+     "        def forward(self, x):\n",
+     "            y_old = x @ self.w0.t() + self.b0\n",
+     "            y_new = self.linear(x)\n",
+     "            return y_old + y_new\n",
+     "\n",
+     "    model = Model(w0, b0)\n",
+     "    model.cuda()\n",
+     "\n",
+     "    criterion = wxe_fn\n",
+     "    if opt == 'sgd':\n",
+     "        optimizer = torch.optim.SGD(model.parameters(), lr=lr, weight_decay=0., momentum=0.)\n",
+     "    elif opt == 'adam':\n",
+     "        optimizer = torch.optim.Adam(model.parameters(), lr=lr)\n",
+     "    else:\n",
+     "        raise NotImplementedError\n",
+     "\n",
+     "    mean_accs = []\n",
+     "    test_mean_accs = []\n",
+     "    mean_group_accs = []\n",
+     "    val_mean_group_accs = []\n",
+     "    wgas = []\n",
+     "    test_wgas = []\n",
+     "    val_wgas = []\n",
+     "    losses = []\n",
+     "    val_losses = []\n",
+     "    regs = []\n",
+     "    weights_by_groups = []\n",
+     "    acc_by_groups = []\n",
+     "    val_acc_by_groups = []\n",
+     "    test_accs_by_groups = []\n",
+     "    weighted_acc = []\n",
+     "    val_weighted_acc = []\n",
+     "\n",
+     "    initial_logits = reweighting_embeddings @ w0.t() + b0\n",
+     "    weights = compute_afr_weights(initial_logits, reweighting_y, gamma, balance_classes)\n",
+     "    if group_uniform:\n",
+     "        # uniform total weights per group\n",
+     "        group_counts = torch.bincount(reweighting_groups)\n",
+     "        for g in range(len(group_counts)):\n",
+     "            weights[reweighting_groups == g] = 1 / group_counts[g] / len(group_counts)\n",
+     "    for _ in (pbar := tqdm.tqdm(range(num_epochs), disable=silent)):\n",
+     "        optimizer.zero_grad()\n",
+     "        logits = model(reweighting_embeddings)\n",
+     "        loss = criterion(logits, reweighting_y, weights)\n",
+     "        reg = model.linear.weight.pow(2).sum() + model.linear.bias.pow(2).sum()\n",
+     "        loss += reg_coeff * reg\n",
+     "\n",
+     "        loss.backward()\n",
+     "        # clip gradients\n",
+     "        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)\n",
+     "        optimizer.step()\n",
+     "        # additional infos\n",
+     "        with torch.no_grad():\n",
+     "            val_logits = model(val_embeddings)\n",
+     "            val_weights = compute_afr_weights(val_logits, val_y, gamma, balance_classes)\n",
+     "            ce = torch.nn.functional.cross_entropy(logits, reweighting_y, reduction='none')\n",
+     "            accs = get_accs(torch.argmax(logits, -1), reweighting_y, reweighting_groups)\n",
+     "            val_accs = get_accs(torch.argmax(model(val_embeddings), -1), val_y, val_groups)\n",
+     "            test_accs = get_accs(torch.argmax(model(test_embeddings), -1), test_y, test_groups)\n",
+     "        \n",
+     "            weights_by_group = [weights[reweighting_groups == g].sum().item() for g in range(num_groups)]\n",
+     "            weights_by_groups.append(weights_by_group)\n",
+     "            acc_by_groups.append(accs)\n",
+     "            val_acc_by_groups.append(val_accs)\n",
+     "            test_accs_by_groups.append(test_accs)\n",
+     "            mean_acc = (np.array(accs) * np.array(trian_group_ratios)).sum()\n",
+     "            mean_group_accs.append(np.array(accs).mean())\n",
+     "            mean_accs.append(mean_acc)\n",
+     "            val_mean_group_accs.append(np.array(val_accs).mean())\n",
+     "            wga = min(accs)\n",
+     "            test_wga = min(test_accs)\n",
+     "            val_wga = min(val_accs)\n",
+     "            wgas.append(wga)\n",
+     "            val_wgas.append(val_wga)\n",
+     "            test_wgas.append(test_wga)\n",
+     "            # test mean acc is test_accs weighted by trian_group_ratios\n",
+     "            test_mean_acc = (np.array(test_accs) * np.array(trian_group_ratios)).sum()\n",
+     "            test_mean_accs.append(test_mean_acc)\n",
+     "            losses.append(loss.item())\n",
+     "            regs.append(reg.item())\n",
+     "            weighted_acc.append((((torch.argmax(logits, -1) == reweighting_y).float() * weights).sum() / weights.sum()).item())\n",
+     "            val_weighted_acc.append((((torch.argmax(val_logits, -1) == val_y).float() * val_weights).sum() / val_weights.sum()).item())\n",
+     "            val_losses.append(criterion(val_logits, val_y, val_weights).item())\n",
+     "            pbar.set_description(f\"Loss: {loss.item():.5f}, WGA: {wga:.3f}, TWGA: {test_wga:.3f}\")\n",
+     "\n",
+     "    \n",
+     "    if early_stop == 'wga':\n",
+     "        earlystop_epoch = np.argmax(val_wgas)\n",
+     "        early_stop_metric = np.max(val_wgas)\n",
+     "    elif early_stop == 'wga@max_val_wa':\n",
+     "        earlystop_epoch = np.argmax(val_weighted_acc)\n",
+     "        early_stop_metric = val_wgas[earlystop_epoch]\n",
+     "    elif early_stop == 'mga':\n",
+     "        earlystop_epoch = np.argmax(val_mean_group_accs)\n",
+     "        early_stop_metric = np.max(val_mean_group_accs)\n",
+     "    elif early_stop == 'none':\n",
+     "        earlystop_epoch = num_epochs - 1\n",
+     "        early_stop_metric = val_wgas[-1]\n",
+     "    else:\n",
+     "        raise ValueError(f\"Unknown early_stop: {early_stop}\")\n",
+     "    earlystop_twga = test_wgas[earlystop_epoch]\n",
+     "    earlystop_tmacc = test_mean_accs[earlystop_epoch]\n",
+     "    final_twga = test_wgas[-1]\n",
+     "    final_tmacc = test_mean_accs[-1]\n",
+     "    if plot:\n",
+     "        # print test wga at best reweighting wga epoch\n",
+     "        print(f\"Final test WGA: {final_twga:.3f}\")\n",
+     "        print(f\"Final test mean acc: {final_tmacc:.3f}\")\n",
+     "        print(f\"Early stopping test WGA: {earlystop_twga:.3f} at epoch {earlystop_epoch}\") \n",
+     "        print(f\"Early stopping test mean acc: {earlystop_tmacc:.3f} at epoch {earlystop_epoch}\")\n",
+     "\n",
+     "        # 3 horizontal subplots\n",
+     "        fig, (ax1, ax2, ax3, ax4) = plt.subplots(1, 4, figsize=(20, 5))\n",
+     "        ax1.plot(losses, label=\"CWXE\")\n",
+     "        ax1.plot(regs, label=\"Reg\")\n",
+     "        ax1.grid()\n",
+     "        ax1.legend(loc=\"lower right\")\n",
+     "        ax1.set_xlabel(\"Epochs\")\n",
+     "        ax1.set_ylabel(\"Loss\")\n",
+     "\n",
+     "        ax2.plot(test_wgas, label=\"Test\")\n",
+     "        ax2.plot(wgas, label=\"Reweighting\")\n",
+     "        ax2.plot(val_wgas, label=\"Validation\")\n",
+     "        ax2.grid()\n",
+     "        ax2.legend(loc=\"lower right\")\n",
+     "        ax2.set_xlabel(\"Epochs\")\n",
+     "        ax2.set_ylabel(\"WGA\")\n",
+     "\n",
+     "        ax3.plot(test_mean_accs, label=\"Test\")\n",
+     "        ax3.plot(mean_accs, label=\"Reweighting\")\n",
+     "        ax3.grid()\n",
+     "        ax3.legend(loc=\"lower right\")\n",
+     "        ax3.set_xlabel(\"Epochs\")\n",
+     "        ax3.set_ylabel(\"Mean Acc\")\n",
+     "\n",
+     "        ax4.plot(weighted_acc, label=\"Reweighting\")\n",
+     "        ax4.plot(val_weighted_acc, label=\"Validation\")\n",
+     "        ax4.grid()\n",
+     "        ax4.set_xlabel(\"Epochs\")\n",
+     "        ax4.set_ylabel(\"Weighted Acc\")\n",
+     "        ax4.legend(loc=\"lower right\")\n",
+     "        plt.show()\n",
+     "\n",
+     "        # 3 horizontal subplots\n",
+     "        fig, (ax1, ax2, ax3, ax4) = plt.subplots(1, 4, figsize=(20, 5))\n",
+     "\n",
+     "        ax1.plot(weights_by_groups, label=[f'G{g+1}' for g in range(num_groups)])\n",
+     "        ax1.grid()\n",
+     "        ax1.set_xlabel(\"Epochs\")\n",
+     "        ax1.set_ylabel(\"Weights\")\n",
+     "        ax1.legend(loc=\"lower right\")\n",
+     "\n",
+     "        for g in range(num_groups):\n",
+     "            ax2.plot([acc[g] for acc in acc_by_groups], label=f\"G{g+1}\", color=f\"C{g}\")\n",
+     "            ax2.plot([acc[g] for acc in test_accs_by_groups], color=f\"C{g}\", linestyle=\":\")\n",
+     "        ax2.grid()\n",
+     "        ax2.set_xlabel(\"Epochs\")\n",
+     "        ax2.set_ylabel(\"Acc\")\n",
+     "        ax2.legend(loc=\"lower right\")\n",
+     "\n",
+     "    return early_stop_metric, earlystop_twga, earlystop_tmacc"
+    ]
+   },
+   {
+    "cell_type": "code",
+-   "execution_count": null,
++   "execution_count": 13,
+    "metadata": {},
+    "outputs": [],
+    "source": [
+     "def hyper_sampler(sweep_config, random=True):\n",
+     "    if random:\n",
+     "        while True:\n",
+     "            lr = np.random.choice(sweep_config[\"lr_choices\"])\n",
+     "            gamma = np.random.choice(sweep_config[\"gamma_choices\"])\n",
+     "            reg_coeff = np.random.choice(sweep_config[\"reg_coeff_choices\"])\n",
+     "            balance_classes = np.random.choice(sweep_config[\"balance_classes_choices\"])\n",
+     "            yield lr, gamma, reg_coeff, balance_classes\n",
+     "    else:\n",
+     "        for lr in sweep_config[\"lr_choices\"]:\n",
+     "            for gamma in sweep_config[\"gamma_choices\"]:\n",
+     "                for reg_coeff in sweep_config[\"reg_coeff_choices\"]:\n",
+     "                    for balance_classes in sweep_config[\"balance_classes_choices\"]:\n",
+     "                        yield lr, gamma, reg_coeff, balance_classes\n",
+     "\n",
+     "def run_training(emb_dict, num_epochs, lr, gamma, reg_coeff, balance_classes, early_stop):\n",
+     "    return train(emb_dict, num_epochs=num_epochs, gamma=gamma, reg_coeff=reg_coeff, lr=lr, balance_classes=balance_classes, early_stop=early_stop, plot=False, silent=True), (lr, gamma, reg_coeff, balance_classes)"
+    ]
+   },
+   {
+    "cell_type": "code",
+-   "execution_count": null,
++   "execution_count": 14,
+    "metadata": {},
+    "outputs": [],
+    "source": [
+     "def sweep(ckpts, args, num_augs, sweep_config, load_emb, skip_if_done, seed=0):\n",
+     "    best_twgas = []\n",
+     "    best_tmaccs = []\n",
+     "    for ckpt in ckpts:\n",
+     "        emb_dict = extract_embeddings(ckpt, args, num_augs, load_emb)\n",
+     "        # same dir but with {sweep_name}.pt\n",
+     "        sweep_file = os.path.join(os.path.dirname(ckpt), sweep_config['sweep_name'] + '.pt')\n",
+     "\n",
+     "        if skip_if_done and os.path.exists(sweep_file):\n",
+     "            twga = torch.load(sweep_file)['best_twga']\n",
+     "            print(f\"Skipping {ckpt}: TWGA {twga:.3f}\")\n",
+     "            best_twgas.append(twga)\n",
+     "            best_tmaccs.append(torch.load(sweep_file)['best_tmacc'])\n",
+     "            continue\n",
+     "\n",
+     "        # break\n",
+     "        # find best hyperparameters\n",
+     "        best_vwga = 0\n",
+     "        best_twga = 0\n",
+     "        best_tmacc = 0\n",
+     "        best_hyperparams = None\n",
+     "        top10_choices = []\n",
+     "        all_results = []\n",
+     "        \n",
+     "        # fix all seeds\n",
+     "        torch.manual_seed(seed)\n",
+     "        np.random.seed(seed)\n",
+     "        import random\n",
+     "        random.seed(seed)\n",
+     "        \n",
+     "        # subsample validation set\n",
+     "        if sweep_config['val_prop'] < 1:\n",
+     "            val_size = int(emb_dict['val_e'].shape[0] * sweep_config['val_prop'])\n",
+     "            val_idx = np.random.choice(emb_dict['val_e'].shape[0], val_size, replace=False)\n",
+     "            emb_dict['val_e'] = emb_dict['val_e'][val_idx]\n",
+     "            emb_dict['val_y'] = emb_dict['val_y'][val_idx]\n",
+     "            emb_dict['val_g'] = emb_dict['val_g'][val_idx]\n",
+     "        print(f'Tuning hypers on {emb_dict[\"val_e\"].shape[0]} val examples')\n",
+     "        sampler = hyper_sampler(sweep_config, random=sweep_config['random'])\n",
+     "        for i in (pbar:= tqdm.tqdm(range(sweep_config['n_trials']))):\n",
+     "            try:\n",
+     "                lr, gamma, reg_coeff, balance_classes = next(sampler)\n",
+     "            except StopIteration:\n",
+     "                break\n",
+     "            (val_wga, test_wga, test_macc), hyperparams = run_training(emb_dict, sweep_config['num_epochs'], lr, gamma, reg_coeff, balance_classes, sweep_config['early_stop'])\n",
+     "            all_results.append([gamma, reg_coeff, val_wga, test_wga])\n",
+     "            if val_wga > best_vwga:\n",
+     "                best_vwga = val_wga\n",
+     "                best_twga = test_wga\n",
+     "                best_tmacc = test_macc\n",
+     "                best_hyperparams = hyperparams\n",
+     "                lr, gamma, reg_coeff, balance_classes = best_hyperparams\n",
+     "                pbar.set_description(f\"Test WGA: {test_wga:.3f}, Val WGA: {val_wga:.3f}, lr: {lr:.2g}, gamma: {gamma:.3f}, reg_coeff: {reg_coeff:.3f}, balance_classes: {balance_classes}\")\n",
+     "            if len(top10_choices) < 10:\n",
+     "                top10_choices.append((test_wga, val_wga, hyperparams))\n",
+     "                top10_choices = sorted(top10_choices, key=lambda x: x[1], reverse=True)\n",
+     "            else:\n",
+     "                top10_choices = sorted(top10_choices, key=lambda x: x[1], reverse=True)\n",
+     "                if val_wga > top10_choices[-1][1]:\n",
+     "                    top10_choices[-1] = (test_wga, val_wga, hyperparams)\n",
+     "\n",
+     "        # save sweep results, indicate data_transform and num aug\n",
+     "        torch.save({\n",
+     "            'best_twga': best_twga,\n",
+     "            'best_tmacc': best_tmacc,\n",
+     "            'best_hyperparams': best_hyperparams,\n",
+     "            'top10_choices': top10_choices,\n",
+     "            'sweep_config': sweep_config,\n",
+     "            'all_results': all_results,\n",
+     "        }, sweep_file)\n",
+     "        best_twgas.append(best_twga)\n",
+     "        best_tmaccs.append(best_tmacc)\n",
+     "\n",
+     "    # print mean and std of best WGA\n",
+     "    print(f\"Mean best WGA: {np.mean(best_twgas):.3f}, std: {np.std(best_twgas):.3f}\")\n",
+     "    # print mean and std of mean acc\n",
+     "    print(f\"Mean best mean acc: {np.mean(best_tmaccs):.3f}, std: {np.std(best_tmaccs):.3f}\")\n",
+     "    return np.mean(best_twgas), np.std(best_twgas), np.mean(best_tmaccs), np.std(best_tmaccs)"
+    ]
+   },
+   {
+    "attachments": {},
+    "cell_type": "markdown",
+    "metadata": {},
+    "source": [
+     " ## WB ##"
+    ]
+   },
+   {
+    "cell_type": "code",
+-   "execution_count": null,
++   "execution_count": 15,
+    "metadata": {},
+-   "outputs": [],
++   "outputs": [
++    {
++     "name": "stderr",
++     "output_type": "stream",
++     "text": [
++      "/home/eng/eisenbr2/anaconda3/envs/cbm/lib/python3.9/site-packages/torchvision/models/_utils.py:208: UserWarning: The parameter 'pretrained' is deprecated since 0.13 and may be removed in the future, please use 'weights' instead.\n",
++      "  warnings.warn(\n",
++      "/home/eng/eisenbr2/anaconda3/envs/cbm/lib/python3.9/site-packages/torchvision/models/_utils.py:223: UserWarning: Arguments other than a weight enum or `None` for 'weights' are deprecated since 0.13 and may be removed in the future. The current behavior is equivalent to passing `weights=ResNet50_Weights.IMAGENET1K_V1`. You can also use `weights=ResNet50_Weights.DEFAULT` to get the most up-to-date weights.\n",
++      "  warnings.warn(msg)\n"
++     ]
++    },
++    {
++     "ename": "FileNotFoundError",
++     "evalue": "[Errno 2] No such file or directory: '/dsi/ofirlin-lab/eisenbr2/waterbirds/spurious_old/checkpoints/wb/80_1/final_checkpoint.pt'",
++     "output_type": "error",
++     "traceback": [
++      "\u001b[0;31m---------------------------------------------------------------------------\u001b[0m",
++      "\u001b[0;31mFileNotFoundError\u001b[0m                         Traceback (most recent call last)",
++      "Cell \u001b[0;32mIn[15], line 38\u001b[0m\n\u001b[1;32m      6\u001b[0m args \u001b[38;5;241m=\u001b[39m SimpleNamespace(\n\u001b[1;32m      7\u001b[0m         data_transform\u001b[38;5;241m=\u001b[39m\u001b[38;5;124m'\u001b[39m\u001b[38;5;124mNoAugWaterbirdsCelebATransform\u001b[39m\u001b[38;5;124m'\u001b[39m,\n\u001b[1;32m      8\u001b[0m         dataset\u001b[38;5;241m=\u001b[39m\u001b[38;5;124m'\u001b[39m\u001b[38;5;124mSpuriousDataset\u001b[39m\u001b[38;5;124m'\u001b[39m,\n\u001b[0;32m   (...)\u001b[0m\n\u001b[1;32m     24\u001b[0m         val_prop\u001b[38;5;241m=\u001b[39m\u001b[38;5;241m1\u001b[39m, \u001b[38;5;66;03m# subsampling happens in sweep function\u001b[39;00m\n\u001b[1;32m     25\u001b[0m     )\n\u001b[1;32m     26\u001b[0m sweep_config \u001b[38;5;241m=\u001b[39m {\n\u001b[1;32m     27\u001b[0m     \u001b[38;5;124m\"\u001b[39m\u001b[38;5;124mn_trials\u001b[39m\u001b[38;5;124m\"\u001b[39m: \u001b[38;5;241m33\u001b[39m \u001b[38;5;241m*\u001b[39m \u001b[38;5;241m4\u001b[39m,\n\u001b[1;32m     28\u001b[0m     \u001b[38;5;124m\"\u001b[39m\u001b[38;5;124mnum_epochs\u001b[39m\u001b[38;5;124m\"\u001b[39m: \u001b[38;5;241m500\u001b[39m,\n\u001b[0;32m   (...)\u001b[0m\n\u001b[1;32m     36\u001b[0m     \u001b[38;5;124m\"\u001b[39m\u001b[38;5;124msweep_name\u001b[39m\u001b[38;5;124m\"\u001b[39m: \u001b[38;5;124m'\u001b[39m\u001b[38;5;124mnominal\u001b[39m\u001b[38;5;124m'\u001b[39m\n\u001b[1;32m     37\u001b[0m     }\n\u001b[0;32m---> 38\u001b[0m \u001b[43msweep\u001b[49m\u001b[43m(\u001b[49m\u001b[43mWB_CKPTS\u001b[49m\u001b[43m,\u001b[49m\u001b[43m \u001b[49m\u001b[43margs\u001b[49m\u001b[43m,\u001b[49m\u001b[43m \u001b[49m\u001b[43mnum_augs\u001b[49m\u001b[43m,\u001b[49m\u001b[43m \u001b[49m\u001b[43msweep_config\u001b[49m\u001b[43m,\u001b[49m\u001b[43m \u001b[49m\u001b[43mload_emb\u001b[49m\u001b[43m,\u001b[49m\u001b[43m \u001b[49m\u001b[43mskip_if_done\u001b[49m\u001b[43m)\u001b[49m\n",
++      "Cell \u001b[0;32mIn[14], line 5\u001b[0m, in \u001b[0;36msweep\u001b[0;34m(ckpts, args, num_augs, sweep_config, load_emb, skip_if_done, seed)\u001b[0m\n\u001b[1;32m      3\u001b[0m best_tmaccs \u001b[38;5;241m=\u001b[39m []\n\u001b[1;32m      4\u001b[0m \u001b[38;5;28;01mfor\u001b[39;00m ckpt \u001b[38;5;129;01min\u001b[39;00m ckpts:\n\u001b[0;32m----> 5\u001b[0m     emb_dict \u001b[38;5;241m=\u001b[39m \u001b[43mextract_embeddings\u001b[49m\u001b[43m(\u001b[49m\u001b[43mckpt\u001b[49m\u001b[43m,\u001b[49m\u001b[43m \u001b[49m\u001b[43margs\u001b[49m\u001b[43m,\u001b[49m\u001b[43m \u001b[49m\u001b[43mnum_augs\u001b[49m\u001b[43m,\u001b[49m\u001b[43m \u001b[49m\u001b[43mload_emb\u001b[49m\u001b[43m)\u001b[49m\n\u001b[1;32m      6\u001b[0m     \u001b[38;5;66;03m# same dir but with {sweep_name}.pt\u001b[39;00m\n\u001b[1;32m      7\u001b[0m     sweep_file \u001b[38;5;241m=\u001b[39m os\u001b[38;5;241m.\u001b[39mpath\u001b[38;5;241m.\u001b[39mjoin(os\u001b[38;5;241m.\u001b[39mpath\u001b[38;5;241m.\u001b[39mdirname(ckpt), sweep_config[\u001b[38;5;124m'\u001b[39m\u001b[38;5;124msweep_name\u001b[39m\u001b[38;5;124m'\u001b[39m] \u001b[38;5;241m+\u001b[39m \u001b[38;5;124m'\u001b[39m\u001b[38;5;124m.pt\u001b[39m\u001b[38;5;124m'\u001b[39m)\n",
++      "Cell \u001b[0;32mIn[10], line 7\u001b[0m, in \u001b[0;36mextract_embeddings\u001b[0;34m(ckpt, args, num_augs, load_emb, model_cls)\u001b[0m\n\u001b[1;32m      4\u001b[0m n_classes \u001b[38;5;241m=\u001b[39m train_loader\u001b[38;5;241m.\u001b[39mdataset\u001b[38;5;241m.\u001b[39mn_classes\n\u001b[1;32m      6\u001b[0m model \u001b[38;5;241m=\u001b[39m model_cls(n_classes)\n\u001b[0;32m----> 7\u001b[0m model\u001b[38;5;241m.\u001b[39mload_state_dict(\u001b[43mtorch\u001b[49m\u001b[38;5;241;43m.\u001b[39;49m\u001b[43mload\u001b[49m\u001b[43m(\u001b[49m\u001b[43mckpt\u001b[49m\u001b[43m)\u001b[49m)\n\u001b[1;32m      8\u001b[0m model\u001b[38;5;241m.\u001b[39mcuda(); model\u001b[38;5;241m.\u001b[39meval();\n\u001b[1;32m     10\u001b[0m classifier \u001b[38;5;241m=\u001b[39m model\u001b[38;5;241m.\u001b[39mfc\n",
++      "File \u001b[0;32m~/anaconda3/envs/cbm/lib/python3.9/site-packages/torch/serialization.py:1425\u001b[0m, in \u001b[0;36mload\u001b[0;34m(f, map_location, pickle_module, weights_only, mmap, **pickle_load_args)\u001b[0m\n\u001b[1;32m   1422\u001b[0m \u001b[38;5;28;01mif\u001b[39;00m \u001b[38;5;124m\"\u001b[39m\u001b[38;5;124mencoding\u001b[39m\u001b[38;5;124m\"\u001b[39m \u001b[38;5;129;01mnot\u001b[39;00m \u001b[38;5;129;01min\u001b[39;00m pickle_load_args\u001b[38;5;241m.\u001b[39mkeys():\n\u001b[1;32m   1423\u001b[0m     pickle_load_args[\u001b[38;5;124m\"\u001b[39m\u001b[38;5;124mencoding\u001b[39m\u001b[38;5;124m\"\u001b[39m] \u001b[38;5;241m=\u001b[39m \u001b[38;5;124m\"\u001b[39m\u001b[38;5;124mutf-8\u001b[39m\u001b[38;5;124m\"\u001b[39m\n\u001b[0;32m-> 1425\u001b[0m \u001b[38;5;28;01mwith\u001b[39;00m \u001b[43m_open_file_like\u001b[49m\u001b[43m(\u001b[49m\u001b[43mf\u001b[49m\u001b[43m,\u001b[49m\u001b[43m \u001b[49m\u001b[38;5;124;43m\"\u001b[39;49m\u001b[38;5;124;43mrb\u001b[39;49m\u001b[38;5;124;43m\"\u001b[39;49m\u001b[43m)\u001b[49m \u001b[38;5;28;01mas\u001b[39;00m opened_file:\n\u001b[1;32m   1426\u001b[0m     \u001b[38;5;28;01mif\u001b[39;00m _is_zipfile(opened_file):\n\u001b[1;32m   1427\u001b[0m         \u001b[38;5;66;03m# The zipfile reader is going to advance the current file position.\u001b[39;00m\n\u001b[1;32m   1428\u001b[0m         \u001b[38;5;66;03m# If we want to actually tail call to torch.jit.load, we need to\u001b[39;00m\n\u001b[1;32m   1429\u001b[0m         \u001b[38;5;66;03m# reset back to the original position.\u001b[39;00m\n\u001b[1;32m   1430\u001b[0m         orig_position \u001b[38;5;241m=\u001b[39m opened_file\u001b[38;5;241m.\u001b[39mtell()\n",
++      "File \u001b[0;32m~/anaconda3/envs/cbm/lib/python3.9/site-packages/torch/serialization.py:751\u001b[0m, in \u001b[0;36m_open_file_like\u001b[0;34m(name_or_buffer, mode)\u001b[0m\n\u001b[1;32m    749\u001b[0m \u001b[38;5;28;01mdef\u001b[39;00m \u001b[38;5;21m_open_file_like\u001b[39m(name_or_buffer, mode):\n\u001b[1;32m    750\u001b[0m     \u001b[38;5;28;01mif\u001b[39;00m _is_path(name_or_buffer):\n\u001b[0;32m--> 751\u001b[0m         \u001b[38;5;28;01mreturn\u001b[39;00m \u001b[43m_open_file\u001b[49m\u001b[43m(\u001b[49m\u001b[43mname_or_buffer\u001b[49m\u001b[43m,\u001b[49m\u001b[43m \u001b[49m\u001b[43mmode\u001b[49m\u001b[43m)\u001b[49m\n\u001b[1;32m    752\u001b[0m     \u001b[38;5;28;01melse\u001b[39;00m:\n\u001b[1;32m    753\u001b[0m         \u001b[38;5;28;01mif\u001b[39;00m \u001b[38;5;124m\"\u001b[39m\u001b[38;5;124mw\u001b[39m\u001b[38;5;124m\"\u001b[39m \u001b[38;5;129;01min\u001b[39;00m mode:\n",
++      "File \u001b[0;32m~/anaconda3/envs/cbm/lib/python3.9/site-packages/torch/serialization.py:732\u001b[0m, in \u001b[0;36m_open_file.__init__\u001b[0;34m(self, name, mode)\u001b[0m\n\u001b[1;32m    731\u001b[0m \u001b[38;5;28;01mdef\u001b[39;00m \u001b[38;5;21m__init__\u001b[39m(\u001b[38;5;28mself\u001b[39m, name, mode):\n\u001b[0;32m--> 732\u001b[0m     \u001b[38;5;28msuper\u001b[39m()\u001b[38;5;241m.\u001b[39m\u001b[38;5;21m__init__\u001b[39m(\u001b[38;5;28;43mopen\u001b[39;49m\u001b[43m(\u001b[49m\u001b[43mname\u001b[49m\u001b[43m,\u001b[49m\u001b[43m \u001b[49m\u001b[43mmode\u001b[49m\u001b[43m)\u001b[49m)\n",
++      "\u001b[0;31mFileNotFoundError\u001b[0m: [Errno 2] No such file or directory: '/dsi/ofirlin-lab/eisenbr2/waterbirds/spurious_old/checkpoints/wb/80_1/final_checkpoint.pt'"
++     ]
++    }
++   ],
+    "source": [
+     "load_emb = True\n",
+     "skip_if_done = True\n",
+     "num_augs = 1\n",
+     "val_prop = 1\n",
+     "\n",
+     "args = SimpleNamespace(\n",
+     "        data_transform='NoAugWaterbirdsCelebATransform',\n",
+     "        dataset='SpuriousDataset',\n",
+     "        data_dir=wb_data_path,\n",
+     "        num_minority_groups_remove=0,\n",
+     "        test_data_dir=None,\n",
+     "        val_size=-1,\n",
+     "        mixup=False,\n",
+     "        batch_size=32,\n",
+     "        reweight_groups=False,\n",
+     "        reweight_classes=False,\n",
+     "        reweight_spurious=False,\n",
+     "        no_shuffle_train=False,\n",
+     "        finetune_on_val=False,\n",
+     "        dfr=False,\n",
+     "        pass_n=0,\n",
+     "        max_prop=1,\n",
+     "        train_prop=-0.2,\n",
+     "        val_prop=1, # subsampling happens in sweep function\n",
+     "    )\n",
+     "sweep_config = {\n",
+     "    \"n_trials\": 33 * 4,\n",
+     "    \"num_epochs\": 500,\n",
+     "    \"lr_choices\": [1e-2],\n",
+     "    \"gamma_choices\": np.linspace(4, 20, 33),\n",
+     "    \"reg_coeff_choices\": [0, 0.1, 0.2, 0.3],\n",
+     "    \"balance_classes_choices\": [True],\n",
+     "    \"early_stop\": 'wga',\n",
+     "    \"random\": False,\n",
+     "    \"val_prop\": val_prop,\n",
+     "    \"sweep_name\": 'nominal'\n",
+     "    }\n",
+     "sweep(WB_CKPTS, args, num_augs, sweep_config, load_emb, skip_if_done)"
+    ]
+   },
+   {
+    "attachments": {},
+    "cell_type": "markdown",
+    "metadata": {},
+    "source": [
+     " ## CelebA ##"
+    ]
+   },
+   {
+    "cell_type": "code",
+    "execution_count": null,
+    "metadata": {},
+    "outputs": [],
+    "source": [
+     "load_emb = True\n",
+     "skip_if_done = True\n",
+     "num_augs = 1\n",
+     "val_prop = 1\n",
+     "\n",
+     "args = SimpleNamespace(\n",
+     "        data_transform='NoAugWaterbirdsCelebATransform',\n",
+     "        dataset='SpuriousDataset',\n",
+     "        data_dir=celeba_data_path,\n",
+     "        num_minority_groups_remove=0,\n",
+     "        test_data_dir=None,\n",
+     "        val_size=-1,\n",
+     "        mixup=False,\n",
+     "        batch_size=32,\n",
+     "        reweight_groups=False,\n",
+     "        reweight_classes=False,\n",
+     "        reweight_spurious=False,\n",
+     "        no_shuffle_train=False,\n",
+     "        finetune_on_val=False,\n",
+     "        dfr=False,\n",
+     "        pass_n=0,\n",
+     "        max_prop=1,\n",
+     "        train_prop=-0.2,\n",
+     "        val_prop=1, # subsampling happens in sweep function\n",
+     "    )\n",
+     "sweep_config = {\n",
+     "    \"n_trials\": 30,\n",
+     "    \"num_epochs\": 1000,\n",
+     "    \"lr_choices\": [2e-2],\n",
+     "    \"gamma_choices\": np.linspace(1, 3, 10),\n",
+     "    \"reg_coeff_choices\": np.logspace(-3, -1, 3),\n",
+     "    \"balance_classes_choices\": [True],\n",
+     "    \"early_stop\": 'wga',\n",
+     "    \"random\": False, # if True then random search, else grid search\n",
+     "    \"val_prop\": val_prop,\n",
+     "    \"sweep_name\": 'nominal'\n",
+     "    }\n",
+     "sweep(CelebA_CKPTS, args, num_augs, sweep_config, load_emb, skip_if_done)"
+    ]
+   },
+   {
+    "attachments": {},
+    "cell_type": "markdown",
+    "metadata": {},
+    "source": [
+     "### Robustness to $\\gamma$"
+    ]
+   },
+   {
+    "cell_type": "code",
+    "execution_count": null,
+    "metadata": {},
+    "outputs": [],
+    "source": [
+     "# WB\n",
+     "args = SimpleNamespace(\n",
+     "        data_transform='NoAugWaterbirdsCelebATransform',\n",
+     "        dataset='SpuriousDataset',\n",
+     "        data_dir=wb_data_path,\n",
+     "        num_minority_groups_remove=0,\n",
+     "        test_data_dir=None,\n",
+     "        val_size=-1,\n",
+     "        mixup=False,\n",
+     "        batch_size=32,\n",
+     "        reweight_groups=False,\n",
+     "        reweight_classes=False,\n",
+     "        reweight_spurious=False,\n",
+     "        no_shuffle_train=False,\n",
+     "        finetune_on_val=False,\n",
+     "        dfr=False,\n",
+     "        pass_n=0,\n",
+     "        max_prop=1,\n",
+     "        train_prop=-0.2,\n",
+     "        val_prop=1\n",
+     "    )\n",
+     "\n",
+     "num_augs = 1\n",
+     "\n",
+     "gammas = np.linspace(0, 30, 11)\n",
+     "\n",
+     "twgas = []\n",
+     "n_effs = []\n",
+     "for gamma in tqdm.tqdm(gammas):\n",
+     "    twga = []\n",
+     "    n_eff = []\n",
+     "    accs_per_gs = []\n",
+     "    for ckpt in WB_CKPTS:\n",
+     "        emb_dict = extract_embeddings(ckpt, args, num_augs, load_emb=True)\n",
+     "        _, this_twga, _ = train(emb_dict, num_epochs=500, gamma=gamma, reg_coeff=0, lr=1e-2, balance_classes=True, early_stop='wga', plot=False, silent=True)\n",
+     "        e = emb_dict['e'].cuda()\n",
+     "        y = emb_dict['y'].cuda()\n",
+     "        g = emb_dict['g'].cuda()\n",
+     "        w0 = emb_dict['w0'].cuda()\n",
+     "        b0 = emb_dict['b0'].cuda()\n",
+     "        logits = e @ w0.t() + b0\n",
+     "        weights = compute_afr_weights(logits, y, gamma, True)\n",
+     "        n_eff.append(1 / (weights ** 2).sum().item())\n",
+     "        twga.append(this_twga)\n",
+     "    twgas.append(twga)\n",
+     "    n_effs.append(n_eff)\n",
+     "twgas = np.array(twgas)\n",
+     "n_effs = np.array(n_effs)\n",
+     "\n",
+     "mean_wgas = twgas.mean(axis=1) * 100\n",
+     "std_wgas = twgas.std(axis=1) * 100\n",
+     "mean_n_effs = n_effs.mean(axis=1)\n",
+     "std_n_effs = n_effs.std(axis=1)"
+    ]
+   },
+   {
+    "cell_type": "code",
+    "execution_count": null,
+    "metadata": {},
+    "outputs": [],
+    "source": [
+     "from matplotlib import pyplot as plt\n",
+     "import seaborn as sns\n",
+     "sns.set(style=\"whitegrid\", font_scale=2.0, rc={\"lines.linewidth\": 3.0})\n",
+     "sns.set_palette(\"Set1\")\n",
+     "\n",
+     "plt.figure(dpi=100, figsize=(8, 6))\n",
+     "plt.fill_between(gammas, mean_wgas - std_wgas, mean_wgas + std_wgas, alpha=0.2)\n",
+     "plt.plot(gammas, mean_wgas, label='AFR', marker='o', markersize=10)\n",
+     "plt.xlabel(r'$\\gamma$')\n",
+     "\n",
+     "erm = 72.6\n",
+     "\n",
+     "plt.plot([0, max(gammas)], [erm, erm], '--', label='ERM')\n",
+     "plt.ylim(bottom=60)\n",
+     "\n",
+     "plt.ylabel('Test WGA [%]')\n",
+     "plt.legend()\n",
+     "plt.tight_layout()\n",
+     "plt.savefig('../plots/wb_wga_vs_gamma.pdf')\n",
+     "\n",
+     "\n",
+     "plt.figure(dpi=100, figsize=(8, 6))\n",
+     "plt.fill_between(gammas, mean_n_effs - std_n_effs, mean_n_effs + std_n_effs, alpha=0.2)\n",
+     "plt.plot(gammas, mean_n_effs, marker='o', markersize=10)\n",
+     "plt.xlabel(r'$\\gamma$')\n",
+     "plt.ylabel(r'Effective # Samples')\n",
+     "plt.yscale('log')\n",
+     "plt.tight_layout()\n",
+     "# plt.savefig('../plots/wb_effsize_vs_gamma.pdf')"
+    ]
+   },
+   {
+    "cell_type": "code",
+    "execution_count": null,
+    "metadata": {},
+    "outputs": [],
+    "source": [
+     "# CelebA\n",
+     "args = SimpleNamespace(\n",
+     "        data_transform='NoAugWaterbirdsCelebATransform',\n",
+     "        dataset='SpuriousDataset',\n",
+     "        data_dir = celeba_data_path,\n",
+     "        num_minority_groups_remove=0,\n",
+     "        test_data_dir=None,\n",
+     "        val_size=-1,\n",
+     "        mixup=False,\n",
+     "        batch_size=32,\n",
+     "        reweight_groups=False,\n",
+     "        reweight_classes=False,\n",
+     "        reweight_spurious=False,\n",
+     "        no_shuffle_train=False,\n",
+     "        finetune_on_val=False,\n",
+     "        dfr=False,\n",
+     "        pass_n=0,\n",
+     "        max_prop=1,\n",
+     "        train_prop=-0.2,\n",
+     "        val_prop=1,\n",
+     "    )\n",
+     "num_augs = 1\n",
+     "\n",
+     "gammas = np.linspace(0, 30, 11)\n",
+     "\n",
+     "twgas = []\n",
+     "n_effs = []\n",
+     "for gamma in tqdm.tqdm(gammas):\n",
+     "    twga = []\n",
+     "    n_eff = []\n",
+     "    accs_per_gs = []\n",
+     "    for ckpt in CelebA_CKPTS:\n",
+     "        emb_dict = extract_embeddings(ckpt, args, num_augs, load_emb=True)\n",
+     "        _, this_twga, _ = train(emb_dict, num_epochs=500, gamma=gamma, reg_coeff=0, lr=1e-2, balance_classes=True, early_stop='wga', plot=False, silent=True)\n",
+     "        e = emb_dict['e'].cuda()\n",
+     "        y = emb_dict['y'].cuda()\n",
+     "        g = emb_dict['g'].cuda()\n",
+     "        w0 = emb_dict['w0'].cuda()\n",
+     "        b0 = emb_dict['b0'].cuda()\n",
+     "        logits = e @ w0.t() + b0\n",
+     "        weights = compute_afr_weights(logits, y, gamma, True)\n",
+     "        n_eff.append(1 / (weights ** 2).sum().item())\n",
+     "        twga.append(this_twga)\n",
+     "    twgas.append(twga)\n",
+     "    n_effs.append(n_eff)\n",
+     "twgas = np.array(twgas)\n",
+     "n_effs = np.array(n_effs)\n",
+     "\n",
+     "mean_wgas = twgas.mean(axis=1) * 100\n",
+     "std_wgas = twgas.std(axis=1) * 100\n",
+     "mean_n_effs = n_effs.mean(axis=1)\n",
+     "std_n_effs = n_effs.std(axis=1)"
+    ]
+   },
+   {
+    "cell_type": "code",
+    "execution_count": null,
+    "metadata": {},
+    "outputs": [],
+    "source": [
+     "from matplotlib import pyplot as plt\n",
+     "import seaborn as sns\n",
+     "sns.set(style=\"whitegrid\", font_scale=2.0, rc={\"lines.linewidth\": 3.0})\n",
+     "sns.set_palette(\"Set1\")\n",
+     "\n",
+     "plt.figure(dpi=100, figsize=(8, 6))\n",
+     "plt.fill_between(gammas, mean_wgas - std_wgas, mean_wgas + std_wgas, alpha=0.2)\n",
+     "plt.plot(gammas, mean_wgas, label='AFR', marker='o', markersize=10)\n",
+     "plt.xlabel(r'$\\gamma$')\n",
+     "\n",
+     "erm = 47.2\n",
+     "\n",
+     "plt.plot([0, max(gammas)], [erm, erm], '--', label='ERM')\n",
+     "plt.ylim(bottom=40)\n",
+     "plt.ylabel('Test WGA [%]')\n",
+     "plt.legend()\n",
+     "plt.tight_layout()\n",
+     "plt.savefig('../plots/celeba_wga_vs_gamma.pdf')\n",
+     "\n",
+     "\n",
+     "plt.figure(dpi=100, figsize=(8, 6))\n",
+     "plt.fill_between(gammas, mean_n_effs - std_n_effs, mean_n_effs + std_n_effs, alpha=0.2)\n",
+     "plt.plot(gammas, mean_n_effs, marker='o', markersize=10)\n",
+     "plt.xlabel(r'$\\gamma$')\n",
+     "plt.ylabel(r'Effective # Samples')\n",
+     "plt.yscale('log')\n",
+     "plt.tight_layout()\n",
+     "plt.savefig('../plots/celeba_effsize_vs_gamma.pdf')"
+    ]
+   },
+   {
+    "attachments": {},
+    "cell_type": "markdown",
+    "metadata": {},
+    "source": [
+     "### Group Label Efficiency / Down-sampled Validation Set"
+    ]
+   },
+   {
+    "cell_type": "code",
+    "execution_count": null,
+    "metadata": {},
+    "outputs": [],
+    "source": [
+     "# We provide an example for Waterbirds\n",
+     "for seed in [0, 21, 42]:\n",
+     "    for num_augs in [1]:\n",
+     "        for val_prop in [0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5]:\n",
+     "            args = SimpleNamespace(\n",
+     "                    data_transform='NoAugWaterbirdsCelebATransform',\n",
+     "                    dataset='SpuriousDataset',\n",
+     "                    data_dir=wb_data_path,\n",
+     "                    num_minority_groups_remove=0,\n",
+     "                    test_data_dir=None,\n",
+     "                    val_size=-1,\n",
+     "                    mixup=False,\n",
+     "                    batch_size=32,\n",
+     "                    reweight_groups=False,\n",
+     "                    reweight_classes=False,\n",
+     "                    reweight_spurious=False,\n",
+     "                    no_shuffle_train=False,\n",
+     "                    finetune_on_val=False,\n",
+     "                    dfr=False,\n",
+     "                    pass_n=0,\n",
+     "                    max_prop=1,\n",
+     "                    train_prop=-0.2,\n",
+     "                    val_prop=1, # subsampling happens in sweep function\n",
+     "                )\n",
+     "            sweep_config = {\n",
+     "                \"n_trials\": 33 * 4,\n",
+     "                \"num_epochs\": 500,\n",
+     "                \"lr_choices\": [1e-2],\n",
+     "                \"gamma_choices\": np.linspace(4, 20, 33),\n",
+     "                \"reg_coeff_choices\": [0, 0.1, 0.2, 0.3],\n",
+     "                \"balance_classes_choices\": [True],\n",
+     "                \"early_stop\": 'none', # as explained in the paper, we do not use early stopping for the sweep\n",
+     "                \"random\": False,\n",
+     "                \"val_prop\": val_prop,\n",
+     "                'sweep_name': f'val_prop_{val_prop}_seed{seed}'\n",
+     "                }\n",
+     "            sweep(WB_CKPTS, args, num_augs, sweep_config, load_emb, skip_if_done, seed=seed)"
+    ]
+   }
+  ],
+  "metadata": {
+   "kernelspec": {
+-   "display_name": "base",
++   "display_name": "cbm",
+    "language": "python",
+    "name": "python3"
+   },
+   "language_info": {
+    "codemirror_mode": {
+     "name": "ipython",
+     "version": 3
+    },
+    "file_extension": ".py",
+    "mimetype": "text/x-python",
+    "name": "python",
+    "nbconvert_exporter": "python",
+    "pygments_lexer": "ipython3",
+-   "version": "3.9.16"
+-  },
+-  "vscode": {
+-   "interpreter": {
+-    "hash": "ca484d7210b95a2e9d854ba4e3641b0188ec8a1dc74d767b9af89b5f3db9867a"
+-   }
++   "version": "3.9.21"
+   }
+  },
+  "nbformat": 4,
+  "nbformat_minor": 4
+ }
+diff --git train_embeddings.py train_embeddings.py
+index fb764a0..c9acd0d 100644
+--- train_embeddings.py
++++ train_embeddings.py
+@@ -1,92 +1,121 @@
+ import os
+ import time
+ import torch
+ import models
+ import optimizers
+ import losses
+-from losses import get_exp_weights
+ import utils
+-from utils.common_utils import get_embeddings_args
+-from utils.common_utils import set_seed
+-from utils.common_utils import get_embeddings_loader
+-from utils.supervised_utils import get_classifier_and_feature_extractor
+-from utils.supervised_utils import take_step
+-from utils.supervised_utils import get_last_layer_model
+-from utils.supervised_utils import rebalance_weights
+-from utils.supervised_utils import normalize_weights
+-from utils.supervised_utils import EmbeddingManager
++from losses import get_exp_weights
++from utils.common_utils import (
++    get_embeddings_args, set_seed, get_embeddings_loader
++)
++from utils.supervised_utils import (
++    get_classifier_and_feature_extractor, take_step, get_last_layer_model,
++    rebalance_weights, normalize_weights, EmbeddingManager
++)
+ from utils.logging import EmbeddingsLogger
+ from utils.general import print_time_taken
++from models import get_model
++from data.datasets import get_dataset
+ 
+ 
+ def train_embeddings(args):
+     assert args.emb_batch_size == -1, f'AFR assumes full batch size (args.emb_batch_size = -1), but got {args.emb_batch_size}'
+     tic = time.time()
+     device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+     set_seed(args.seed)
+     Log = EmbeddingsLogger(args)
+ 
+     train_loader, holdout_loaders = utils.get_data(args, finetune_on_val=args.finetune_on_val)
+     Log.log_data_stats(train_loader, holdout_loaders['test'], holdout_loaders['val'])
+ 
+     resume_ckpt = os.path.join(args.base_model_dir, args.checkpoint)
+-    model = getattr(models, args.model)(holdout_loaders["val"].dataset.n_classes).to(device)
++
++    if args.use_mil:
++        Log.logger.info("🔍 Using MILAttentionModel with masked segments")
++        feature_extractor = getattr(models, 'imagenet_resnet50_pretrained')(holdout_loaders["val"].dataset.n_classes).to(device)
++        model = get_model(
++            args.model,
++            device=device,
++            feature_extractor=feature_extractor,
++            feature_dim=2048,
++            num_classes=holdout_loaders["val"].dataset.n_classes,
++            include_original=args.include_original
++        )
++        classifier = model.classifier
++    else:
++        Log.logger.info("🧠 Using standard classifier")
++        model = getattr(models, args.model)(holdout_loaders["val"].dataset.n_classes).to(device)
++        classifier, feature_extractor = get_classifier_and_feature_extractor(model)
++
++    # Resume weights
+     aux = torch.load(resume_ckpt, map_location=device)
+     if isinstance(aux, dict):
+         model.load_state_dict(aux)
+     else:
+         model = aux
++
+     model.eval()
+     Log.logger.info(f'Model has {utils.count_parameters(model) / 1e6:.2g}M parameters')
+ 
+-    classifier, feature_extractor = get_classifier_and_feature_extractor(model)
+     Embedder = EmbeddingManager(device, args)
+     loaders = (train_loader, holdout_loaders)
+-    all_out = Embedder.get_train_test_embeddings(classifier, feature_extractor, loaders)
++
++    if args.use_mil:
++        all_out = Embedder.get_train_test_embeddings(model, None, loaders)
++    else:
++        all_out = Embedder.get_train_test_embeddings(classifier, feature_extractor, loaders)
++
+     out, out_test, out_val = all_out
++    embeddings, _, groups, y = out
+     test_embeddings, _, test_groups, test_y = out_test
+     val_embeddings, _, val_groups, val_y = out_val
+-    embeddings, _, groups, y = out
++
+     logits = classifier(embeddings).detach()
+     weights = get_exp_weights(logits, y, gamma=args.gamma)
+     if args.rebalance_weights:
+         weights = rebalance_weights(weights, y)
+     weights = normalize_weights(weights)
++
+     loader = get_embeddings_loader(args.emb_batch_size, embeddings, y, weights)
+     init_weights = (classifier.weight.detach().clone(), classifier.bias.detach().clone())
+     Log.log_group_weights(weights, groups, epoch=0)
+ 
+     logits_test = classifier(test_embeddings)
+     _ = Log.generate_acc_groups(logits_test, test_y, test_groups, epoch=0, partition="test")
++
+     Log.save_holdout_data(test_data=(test_embeddings, test_y, test_groups),
+                           val_data=(val_embeddings, val_y, val_groups))
+ 
+     last_layer = get_last_layer_model(init_weights).to(device)
+     last_layer.train()
+     optimizer = getattr(optimizers, args.optimizer)(last_layer, args)
+     scheduler = getattr(optimizers, args.scheduler)(optimizer, args)
+     criterion = getattr(losses, args.loss)()
+ 
+     for epoch in range(args.num_epochs):
+         all_logits = []
+         for ds in loader:
+-            loss, logits = take_step(last_layer, ds, optimizer, criterion, scheduler, init_weights,
+-                                     args.reg_coeff, max_norm=args.grad_norm)
++            loss, logits = take_step(
++                last_layer, ds, optimizer, criterion,
++                scheduler, init_weights, args.reg_coeff,
++                max_norm=args.grad_norm
++            )
+             all_logits.append(logits)
+-        logits = torch.concat(all_logits, dim=0)
+-        if epoch > -1:
+-            Log.logger.info(f"\nE: {epoch} | L: {loss:1.5e} ")
+-            _ = Log.generate_acc_groups(logits, y, groups, epoch + 1, "train")
+-            holdout_logits = (last_layer(test_embeddings), last_layer(val_embeddings))
+-            Log.log_results_save_chkp(epoch + 1, holdout_logits, model=last_layer)
++        logits = torch.cat(all_logits, dim=0)
++
++        Log.logger.info(f"\nE: {epoch} | L: {loss:1.5e} ")
++        _ = Log.generate_acc_groups(logits, y, groups, epoch + 1, "train")
++        holdout_logits = (last_layer(test_embeddings), last_layer(val_embeddings))
++        Log.log_results_save_chkp(epoch + 1, holdout_logits, model=last_layer)
+ 
+     Log.finalize_logging(last_layer)
+     Log.save_plot("./logs/")
+     toc = time.time()
+     print_time_taken(toc - tic)
+ 
+ 
+ if __name__ == '__main__':
+     parser = get_embeddings_args()
+     args = parser.parse_args()
+     train_embeddings(args)
+diff --git utils/common_utils.py utils/common_utils.py
+index 0a35440..7be4581 100644
+--- utils/common_utils.py
++++ utils/common_utils.py
+@@ -1,597 +1,700 @@
+ import torch
+ import os
+ import data
+ import argparse
+ from copy import deepcopy
+ import numpy as np
+ from functools import partial
+ import pandas as pd
+ from types import SimpleNamespace
+ from torch.utils.data import DataLoader
+ from data.datasets import EmbeddingsDataset
+ from utils.logging_utils import get_config_for_wandb
+ from utils.logging_utils import prepare_logging
+ from utils.general import add_timestamp_with_random
+ import wandb
++from data.datasets import get_dataset  # Add this import at the top
++
++from torch.utils.data import DataLoader
++import numpy as np
++import data
++from data.datasets import get_dataset  # assumes your registry/logic lives there
++
++def get_data(args, finetune_on_val=False):
++    transform_cls = getattr(data, args.data_transform)
++    train_transform = transform_cls(train=True)
++    test_transform = transform_cls(train=False)
++
++    dataset_name = args.dataset
++
++    # Dynamically handle MIL-specific args
++    mil_dataset_kwargs = {
++        "include_original": args.include_original,
++        "gradual_shrink": args.gradual_shrink,
++        "masking_strategy": args.masking_strategy,
++        "bag_size": args.bag_size,
++        "max_distance": args.max_distance,
++        "alpha": args.alpha,
++        "crop_scale": args.crop_scale,
++    } if args.use_mil else {}
++
++    # Proper key for dataset loading
++    dataset_key = "basedir" if dataset_name == "SpuriousDataset" else "data_dir"
++
++    # Load training data
++    train_kwargs = {
++        dataset_key: args.data_dir,
++        "split": "train",
++        "transform": train_transform,
++        "prop": args.train_prop,
++        "max_prop": args.max_prop,
++        **mil_dataset_kwargs
++    }
++    trainset = get_dataset(name=dataset_name, **train_kwargs)
++
++    # Load val/test data
++    holdoutsets = {}
++    for split in ["val", "test"]:
++        transform = train_transform if (split == "val" and finetune_on_val) else test_transform
++        prop = 1 if split == "test" else args.val_prop
++        split_kwargs = {
++            dataset_key: args.data_dir,
++            "split": split,
++            "transform": transform,
++            "prop": prop,
++            "max_prop": args.max_prop,
++            **mil_dataset_kwargs
++        }
++        holdoutsets[split] = get_dataset(name=dataset_name, **split_kwargs)
++
++    # Optional: move a few training samples to val set
++    if args.pass_n > 0:
++        trainset, holdoutsets = pass_data_from_train_to_val(trainset, holdoutsets, pass_n=args.pass_n)
++
++    # Optional: subsample val set
++    if args.val_size != -1:
++        print(f"Using only {args.val_size} samples of val data")
++        if args.balance_val:
++            print("Using balanced group ratios for validation set")
++            group_ratios = np.array([1 / 4] * 4)
++        else:
++            print("Using group ratios from train set for validation set")
++            group_ratios = trainset.group_counts / trainset.group_counts.sum()
++            group_ratios = group_ratios / group_ratios.sum()
++        data.subsample_to_size_and_ratio(holdoutsets["val"], args.val_size, group_ratios)
++
++    # Loaders
++    loader_kwargs = {'batch_size': args.batch_size, 'num_workers': 16, 'pin_memory': True}
++    train_loader = DataLoader(trainset, shuffle=True, **loader_kwargs)
++    holdout_loaders = {}
++    for name, ds in holdoutsets.items():
++        shuffle = (name == "val" and finetune_on_val)
++        holdout_loaders[name] = DataLoader(ds, shuffle=shuffle, **loader_kwargs)
++
++    return train_loader, holdout_loaders
+ 
+ 
+ class AverageMeter:
+     def __init__(self):
+         self.reset()
+ 
+     def reset(self):
+         self.val = 0
+         self.avg = 0
+         self.sum = 0
+         self.count = 0
+ 
+     def update(self, val, n=1):
+         self.val = val
+         self.sum += val * n
+         self.count += n
+         self.avg = self.sum / self.count
+ 
+ 
+ def str2bool(v):
+     if isinstance(v, bool):
+         return v
+     if v.lower() in ('yes', 'true', 't', 'y', '1'):
+         return True
+     elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+         return False
+     else:
+         raise argparse.ArgumentTypeError('Boolean value expected.')
+ 
+ 
+ def proportion(num):
+     num = float(num)
+     if abs(num) > 1:
+         return num / 100
+     else:
+         return num
+ 
+ 
+ def get_embeddings_loader(emb_batch_size, embeddings, targets, weights):
+     if emb_batch_size > 0:
+         ds = EmbeddingsDataset(embeddings=embeddings, targets=targets, weights=weights)
+         batch_size = emb_batch_size if emb_batch_size > 0 else len(targets)
+         loader = DataLoader(ds, batch_size=batch_size, shuffle=True)
+     else:
+         loader = [(embeddings, targets, weights)]
+     return loader
+ 
+ 
+ def determine_dfr_train_eval_loaders(tune_on, train_loader, holdout_loaders):
+     if tune_on == "train":
+         loader = train_loader
+         eval_on = {"test": holdout_loaders["test"]}
+     else:
+         loader = holdout_loaders["val"]
+         eval_on = holdout_loaders
+     return loader, eval_on
+ 
+ 
+ def set_seed(seed):
+     if torch.cuda.is_available():
+         torch.cuda.manual_seed(seed)
+     torch.manual_seed(seed)
+     np.random.seed(seed)
+     torch.backends.cudnn.benchmark = False
+     torch.backends.cudnn.deterministic = True
+ 
+ 
+ def initialize_logger(args):
+     args.output_dir = add_timestamp_with_random(args.output_dir, ending='')
+     if args.use_wandb:
+         os.makedirs(args.output_dir, exist_ok=True)
+         config = get_config_for_wandb(args)
+         wandb.init(dir=args.output_dir, project=args.project, name=args.run_name, config=config)
+     defaults = vars(args)
+     for key, value in defaults.items():
+         print(f"{key}: {value}")
+     set_seed(args.seed)
+     logger = prepare_logging(args.output_dir, args)
+     return logger
+ 
+ 
+ def get_y_s(g, n_spurious=1):
+     y = g // n_spurious
+     s = g % n_spurious
+     return y, s
+ 
+ 
+ def update_dict(acc_groups, y, g, logits):
+     preds = torch.argmax(logits, axis=1)
+     correct_batch = (preds == y)
+     g = g.cpu()
+     for g_val in np.unique(g):
+         mask = g == g_val
+         n = mask.sum().item()
+         corr = correct_batch[mask].sum().item()
+         acc_groups[g_val].update(corr / n, n)
+ 
+ 
+ def get_results(acc_groups):
+     groups = acc_groups.keys()
+     results = {}
+     for group in groups:
+         text = f"accuracy_{get_y_s(group)[0]}_{get_y_s(group)[1]}"
+         results.update({text: acc_groups[group].avg})
+     all_correct = sum([acc_groups[g].sum for g in groups])
+     all_total = sum([acc_groups[g].count for g in groups])
+     results.update({"mean_accuracy": all_correct / all_total if all_total > 0 else 0})
+     results.update({"worst_accuracy": min(results.values())})
+     return results
+ 
+ 
+ def count_parameters(model):
+     return sum(p.numel() for p in model.parameters() if p.requires_grad)
+ 
+ 
+ def print_model_params_names(model):
+     for name, _ in model.named_parameters():
+         print(name)
+ 
+ 
+ def get_default_args():
+     parser = argparse.ArgumentParser()
+     parser.add_argument("--model", type=str, required=True, help="base model")
+     parser.add_argument(
+         "--loss", type=str, default="cross_entropy", choices=[
+             "cross_entropy",
+         ])
+     parser.add_argument("--data_dir", type=str, required=True, help="Train dataset directory")
+     parser.add_argument("--train_prop", type=proportion, default=1)
+     parser.add_argument("--val_prop", type=float, default=1)
+     parser.add_argument("--max_prop", type=float, default=1)
+     parser.add_argument("--val_size", type=int, default=-1)
+     parser.add_argument(
+         "--data_transform", type=str, required=False, default="AugWaterbirdsCelebATransform",
+         choices=[
+             "NoTransform",
+             "WildsBase",
+             "AugDominoTransform",
+             "CropDominoTransform",
+             "CropFlipDominoTransform",
+             "FlipDominoTransform",
+             "CropFlipBlurDominoTransform",
+             "NoAugDominoTransform",
+             "SimCLRDominoTransform",
+             "MaskedDominoTransform",
+             "AugWaterbirdsCelebATransform",
+             "SimCLRWaterbirdsCelebATransform",
+             "NoAugWaterbirdsCelebATransform",
+             "NoAugNoNormWaterbirdsCelebATransform",
+             "MaskedWaterbirdsCelebATransform",
+             "ImageNetAugmixTransform",
+             "ImageNetRandomErasingTransform",
+             "SimCLRCifarTransform",
+             "BertTokenizeTransform",
+         ], help="data preprocessing transformation")
+     parser.add_argument(
+         "--dataset", type=str, required=False, default="SpuriousDataset", choices=[
+             "SpuriousDataset",
+             "SpuriousCIFAR10",
+             "MultiNLIDataset",
+             "FakeSpuriousCIFAR10",
+             "DummyMNIST",
+             "MultiColoredMNIST",
+             "ChestXRay",
+             "CirclesData",
+             "CXR",
+             "CXR2",
+             "Camelyon17",
+             "WildsFMOW",
+             "WildsCivilCommentsCoarse",
++            "masked_bag_waterbirds",
+         ], help="dataset type")
+     parser.add_argument("--cmnist_spurious_corr", type=float, default=0.995)
+     parser.add_argument("--project", type=str, help="wandb project name")
+     parser.add_argument("--run_name", type=str, help="wandb run name")
+     parser.add_argument("--output_dir", type=str, help="output directory")
+     parser.add_argument("--eval_freq", type=int, default=50)
+     parser.add_argument("--save_freq", type=int, default=50)
+     parser.add_argument("--seed", type=int, default=1)
+     parser.add_argument("--use_wandb", action="store_true", default=False)
+     parser.add_argument("--batch_size", type=int, default=128)
+     parser.add_argument("--num_epochs", type=int, default=300)
+     parser.add_argument(
+         "--optimizer", type=str, required=False, default="sgd_optimizer",
+         choices=["sgd_optimizer", "adamw_optimizer", "lbfgs",
+                  "bert_adamw_optimizer"], help="optimizer name")
+     parser.add_argument(
+         "--scheduler", type=str, required=False, default="constant_lr_scheduler",
+         choices=["cosine_lr_scheduler", "constant_lr_scheduler",
+                  "bert_lr_scheduler"], help="scheduler name")
+     parser.add_argument("--weight_decay", type=float, default=0.0)
+     parser.add_argument("--momentum", type=float, default=0.9)
+     parser.add_argument("--init_lr", type=float, default=0.1)
+     parser.add_argument("--gamma", type=float, default=0)
+     parser.add_argument("--gradient_starv_lam", type=float, default=0)
+     parser.add_argument("--reweight_groups", action='store_true', help="reweight groups")
+     parser.add_argument("--reweight_classes", action='store_true', help="reweight classes")
+     parser.add_argument("--reweight_spurious", action='store_true',
+                         help="reweight based on spurious attribute")
+     parser.add_argument("--pass_n", type=int, default=0)
+     parser.add_argument("--warm_iters", type=int, default=0)
+     parser.add_argument("--pass_n_train", type=int, default=0)
+     parser.add_argument(
+         "--data_transform_second", type=str, required=False, default="AugWaterbirdsCelebATransform",
+         choices=[
+             "NoTransform",
+             "AugWaterbirdsCelebATransform",
+             "ImageNetAugmixTransform",
+         ])
+     parser.add_argument("--tune_on", type=str, default="train")
+     parser.add_argument("--grad_norm", type=float, default=-1.)
++
++    parser.add_argument('--use_mil', default=False, action='store_true', help='Use MILAttentionModel w/ masked bag inputs')
++    parser.add_argument('--include_original', action='store_true')
++    parser.add_argument('--bag_size', type=int, default=5)
++    parser.add_argument('--masking_strategy', type=str, default='mean_fill_dilation')
++    parser.add_argument('--gradual_shrink', type=str2bool, default=True)
++    parser.add_argument('--max_distance', type=float, default=30.0)
++    parser.add_argument('--alpha', type=float, default=0.1)
++    parser.add_argument('--crop_scale', type=lambda s: tuple(map(float, s.split(','))), default=(0.85, 1.0))
++
++
+     return parser
+ 
+ 
+ def get_minimal_args():
+     parser = argparse.ArgumentParser()
+     parser.add_argument("--model", type=str, required=True, help="base model")
+     parser.add_argument("--data_dir", type=str, required=True, help="Train dataset directory")
+     parser.add_argument("--train_prop", type=proportion, default=1)
+     parser.add_argument("--val_prop", type=float, default=1)
+     parser.add_argument("--max_prop", type=float, default=1)
+     parser.add_argument(
+         "--data_transform", type=str, required=False, default="AugWaterbirdsCelebATransform",
+         choices=[
+             "NoTransform",
+             "WildsBase",
+             "AugDominoTransform",
+             "CropDominoTransform",
+             "CropFlipDominoTransform",
+             "FlipDominoTransform",
+             "CropFlipBlurDominoTransform",
+             "NoAugDominoTransform",
+             "SimCLRDominoTransform",
+             "MaskedDominoTransform",
+             "AugWaterbirdsCelebATransform",
+             "SimCLRWaterbirdsCelebATransform",
+             "NoAugWaterbirdsCelebATransform",
+             "NoAugNoNormWaterbirdsCelebATransform",
+             "MaskedWaterbirdsCelebATransform",
+             "ImageNetAugmixTransform",
+             "ImageNetRandomErasingTransform",
+             "SimCLRCifarTransform",
+             "BertTokenizeTransform",
+         ], help="data preprocessing transformation")
+     parser.add_argument(
+         "--dataset", type=str, required=False, default="SpuriousDataset", choices=[
+             "SpuriousDataset",
+             "Camelyon17",
+             "MultiNLIDataset",
+             "SpuriousCIFAR10",
+             "FakeSpuriousCIFAR10",
+             "DummyMNIST",
+             "MultiColoredMNIST",
+             "ChestXRay",
+             "CXR",
+             "CXR2",
+             "WildsFMOW",
+             "WildsCivilCommentsCoarse",
++            "masked_bag_waterbirds",
+         ], help="dataset type")
+     parser.add_argument("--project", type=str, help="wandb project name")
+     parser.add_argument("--output_dir", type=str, help="output directory")
+     parser.add_argument("--seed", type=int, default=1)
+     parser.add_argument("--use_wandb", action="store_true", default=False)
+     parser.add_argument("--cmnist_spurious_corr", type=float, default=0.995)
+     parser.add_argument("--num_epochs", type=int, default=300)
+     parser.add_argument(
+         "--optimizer", type=str, required=False, default="sgd_optimizer",
+         choices=["sgd_optimizer", "adamw_optimizer", "lbfgs",
+                  "bert_adamw_optimizer"], help="optimizer name")
+     parser.add_argument(
+         "--scheduler", type=str, required=False, default="constant_lr_scheduler",
+         choices=["cosine_lr_scheduler", "constant_lr_scheduler",
+                  "bert_lr_scheduler"], help="scheduler name")
+     parser.add_argument("--weight_decay", type=float, default=0.0)
+     parser.add_argument("--momentum", type=float, default=0.9)
+     parser.add_argument("--init_lr", type=float, default=0.1)
+     parser.add_argument("--gamma", type=float, default=0)
+     parser.add_argument("--tune_on", type=str, default="train")
+     parser.add_argument("--grad_norm", type=float, default=-1.)
+     return parser
+ 
+ 
+ def get_eval_args():
+     parser = get_train_dfr_args()
+     parser.add_argument("--gamma2", type=float, default=0)
+     return parser
+ 
+ 
+ def get_traintwo_args():
+     parser = get_default_args()
+     parser.add_argument("--first_phase_iters", type=int, default=0)
+     parser.add_argument("--second_phase_iters", type=int, default=0)
+     parser.add_argument("--pass_n_train", type=int, default=0)
+     parser.add_argument("--policy", type=str, default="nothing")
+     parser.add_argument(
+         "--data_transform_second", type=str, required=False, default="AugWaterbirdsCelebATransform",
+         choices=[
+             "NoTransform",
+             "AugWaterbirdsCelebATransform",
+             "ImageNetAugmixTransform",
+         ])
+     return parser
+ 
+ 
+ def get_embeddings_args():
+     parser = get_minimal_args()
+     parser.add_argument(
+         "--loss", type=str, default="afr", choices=[
+             "cross_entropy",
+             "afr",
+         ])
+     parser.add_argument("--checkpoint", type=str, default="final_checkpoint.pt")
+     parser.add_argument("--reuse_embeddings", type=str2bool, default=True)
+     parser.add_argument("--save_embeddings", type=str2bool, default=True)
+     parser.add_argument("--rebalance_weights", type=str2bool, default=True)
+     parser.add_argument("--num_augs", type=int, default=1)
+     parser.add_argument("--reg_coeff", type=float, default=0.0)
+     parser.add_argument("--run_name", type=str, help="wandb run name")
+     parser.add_argument("--base_model_dir", type=str, default=None)
+     parser.add_argument("--finetune_on_val", type=str2bool, default=True)
+     parser.add_argument("--pass_n", type=int, default=0)
+     parser.add_argument("--val_size", type=int, default=-1)
+     parser.add_argument("--batch_size", type=int, default=100)
+     parser.add_argument("--emb_batch_size", type=int, default=-1)
++
++    # MIL
++    parser.add_argument('--include_original', action='store_true')
++    parser.add_argument('--bag_size', type=int, default=5)
++    parser.add_argument('--masking_strategy', type=str, default='mean_fill_dilation')
++    parser.add_argument('--gradual_shrink', type=str2bool, default=True)
++    parser.add_argument('--use_mil', default=False, action='store_true', help='Use MILAttentionModel w/ masked bag inputs')
++    parser.add_argument('--max_distance', type=float, default=30.0)
++    parser.add_argument('--alpha', type=float, default=0.1)
++    parser.add_argument('--crop_scale', type=lambda s: tuple(map(float, s.split(','))), default=(0.85, 1.0))
++
+     return parser
+ 
+ 
+ def get_train_dfr_args():
+     parser = get_default_args()
+     parser.add_argument("--base_model_dir", type=str, default=None)
+     parser.add_argument("--balance_val", action='store_true')
+     parser.add_argument("--finetune_on_val", type=str2bool, default=True)
+     parser.add_argument("--policy", type=str, default="fael")
+     return parser
+ 
+ 
+ def get_jtt_args():
+     parser = get_default_args()
+     parser.add_argument("--checkpoint", type=str, default="final_checkpoint.pt")
+     parser.add_argument("--base_model_dir", type=str, default=None)
+     parser.add_argument("--upweight", type=int, default=-1)
+     parser.add_argument("--lr_wd_case", type=int, default=-1)
+     parser.add_argument("--finetune_on_val", type=str2bool, default=True)
+     return parser
+ 
+ 
+ def overwrite_wd_lr_jtt_cases(args):
+     aux = vars(args)
+     if aux["data_dir"].__contains__("waterbirds"):
+         if aux["lr_wd_case"] == 1:
+             aux["init_lr"], aux["weight_decay"] = 1e-3, 1e-4
+         elif aux["lr_wd_case"] == 2:
+             aux["init_lr"], aux["weight_decay"] = 1e-4, 1e-1
+         elif aux["lr_wd_case"] == 3:
+             aux["init_lr"], aux["weight_decay"] = 1e-5, 1e-0
+     elif aux["data_dir"].__contains__("CelebA"):
+         if aux["lr_wd_case"] == 1:
+             aux["init_lr"], aux["weight_decay"] = 1e-4, 1e-4
+         elif aux["lr_wd_case"] == 2:
+             aux["init_lr"], aux["weight_decay"] = 1e-4, 1e-2
+         elif aux["lr_wd_case"] == 3:
+             aux["init_lr"], aux["weight_decay"] = 1e-5, 1e-1
+     args = SimpleNamespace(**aux)
+     return args
+ 
+ 
+ def get_jtt_loader(subset, args):
+     mask = subset["preds"] != subset["ys"]
+     transform_cls = getattr(data, args.data_transform)
+     transform = transform_cls(train=True)
+     if args.dataset.__contains__("CIFAR10"):
+         subset, name = mask, "JTTSpuriousCIFAR10"
+     elif args.dataset.__contains__("CXR"):
+         subset = subset[subset["preds"] != subset["ys"]]["imgs"].tolist()
+         name = "JTTCXR"
+     else:
+         subset = subset[subset["preds"] != subset["ys"]]["imgs"].tolist()
+         name = "JTTSpuriousDataset"
+ 
+     dataset_cls = getattr(data, name)
+     dataset = dataset_cls(basedir=args.data_dir, subset=subset, split="train", transform=transform,
+                           upweight=args.upweight, prop=args.train_prop, max_prop=args.max_prop)
+     loader = DataLoader(dataset, shuffle=True, batch_size=args.batch_size, num_workers=8,
+                         pin_memory=True)
+     return loader
+ 
+ 
+ def get_shrinked_data(subset, data_dir, split, data_transform):
+     transform_cls = getattr(data, data_transform)
+     transform = transform_cls(train=True)
+     dataset_cls = getattr(data, "ShrinkedSpuriousDataset")
+     dataset = dataset_cls(basedir=data_dir, subset=subset, split=split, transform=transform)
+     return dataset
+ 
+-def get_data(args, finetune_on_val=False):
+-    transform_cls = getattr(data, args.data_transform)
+-    train_transform = transform_cls(train=True)
+-    test_transform = transform_cls(train=False)
+-
+-    dataset_cls = getattr(data, args.dataset)
+-    if args.dataset.__contains__("Colored"):
+-        dataset_cls = partial(dataset_cls, spurious_correlation=args.cmnist_spurious_corr)
+-    trainset = dataset_cls(basedir=args.data_dir, split="train", transform=train_transform,
+-                           prop=args.train_prop, max_prop=args.max_prop)
+-
+-    holdoutsets = {}
+-    for split in ["val", "test"]:
+-        transform = train_transform if (split == "val" and finetune_on_val) else test_transform
+-        # transform = train_transform if (split == "test" and finetune_on_val) else test_transform
+-        prop = 1 if split == "test" else args.val_prop
+-        holdoutsets[split] = dataset_cls(basedir=args.data_dir, split=split, transform=transform,
+-                                         prop=prop)
+-
+-    if args.pass_n > 0:
+-        trainset, holdoutsets = pass_data_from_train_to_val(trainset, holdoutsets,
+-                                                            pass_n=args.pass_n)
+-
+-    if args.val_size != -1:
+-        print(f"Using only {args.val_size} samples of val data")
+-        if args.balance_val:
+-            print("Using balanced group ratios for validation set")
+-            group_ratios = np.array([1 / 4] * 4)
+-        else:
+-            print("Using group ratios from train set for validation set")
+-            group_ratios = trainset.group_counts / trainset.group_counts.sum()
+-            group_ratios = group_ratios / group_ratios.sum()
+-        data.subsample_to_size_and_ratio(holdoutsets["val"], args.val_size, group_ratios)
+-        # data.subsample_to_size_and_ratio(holdoutsets["test"], args.val_size, group_ratios)
+-
+-    # collate_fn = data.get_collate_fn(mixup=False, num_classes=trainset.n_classes)
+-    loader_kwargs = {'batch_size': args.batch_size, 'num_workers': 16, 'pin_memory': True}
+-    # sampler = data.get_sampler(trainset, args)
+-    # train_loader = DataLoader(trainset, shuffle=True, sampler=sampler, collate_fn=collate_fn,
+-    #                           **loader_kwargs)
+-    train_loader = DataLoader(trainset, shuffle=True, **loader_kwargs)
+-    holdout_loaders = {}
+-    for name, ds in holdoutsets.items():
+-        shuffle = True if (name == "val" and finetune_on_val) else False
+-        # shuffle = True if (name == "test" and finetune_on_val) else False
+-        holdout_loaders[name] = DataLoader(ds, shuffle=shuffle, **loader_kwargs)
+-    return train_loader, holdout_loaders
+-    # new_holdout_loaders = {}
+-    # new_holdout_loaders["val"] = holdout_loaders["test"]
+-    # new_holdout_loaders["test"] = holdout_loaders["val"]
+-    # return train_loader, new_holdout_loaders
++# def get_data(args, finetune_on_val=False):
++#     transform_cls = getattr(data, args.data_transform)
++#     train_transform = transform_cls(train=True)
++#     test_transform = transform_cls(train=False)
++
++#     dataset_cls = getattr(data, args.dataset)
++#     if args.dataset.__contains__("Colored"):
++#         dataset_cls = partial(dataset_cls, spurious_correlation=args.cmnist_spurious_corr)
++#     trainset = dataset_cls(basedir=args.data_dir, split="train", transform=train_transform,
++#                            prop=args.train_prop, max_prop=args.max_prop)
++
++#     holdoutsets = {}
++#     for split in ["val", "test"]:
++#         transform = train_transform if (split == "val" and finetune_on_val) else test_transform
++#         # transform = train_transform if (split == "test" and finetune_on_val) else test_transform
++#         prop = 1 if split == "test" else args.val_prop
++#         holdoutsets[split] = dataset_cls(basedir=args.data_dir, split=split, transform=transform,
++#                                          prop=prop)
++
++#     if args.pass_n > 0:
++#         trainset, holdoutsets = pass_data_from_train_to_val(trainset, holdoutsets,
++#                                                             pass_n=args.pass_n)
++
++#     if args.val_size != -1:
++#         print(f"Using only {args.val_size} samples of val data")
++#         if args.balance_val:
++#             print("Using balanced group ratios for validation set")
++#             group_ratios = np.array([1 / 4] * 4)
++#         else:
++#             print("Using group ratios from train set for validation set")
++#             group_ratios = trainset.group_counts / trainset.group_counts.sum()
++#             group_ratios = group_ratios / group_ratios.sum()
++#         data.subsample_to_size_and_ratio(holdoutsets["val"], args.val_size, group_ratios)
++#         # data.subsample_to_size_and_ratio(holdoutsets["test"], args.val_size, group_ratios)
++
++#     # collate_fn = data.get_collate_fn(mixup=False, num_classes=trainset.n_classes)
++#     loader_kwargs = {'batch_size': args.batch_size, 'num_workers': 16, 'pin_memory': True}
++#     # sampler = data.get_sampler(trainset, args)
++#     # train_loader = DataLoader(trainset, shuffle=True, sampler=sampler, collate_fn=collate_fn,
++#     #                           **loader_kwargs)
++#     train_loader = DataLoader(trainset, shuffle=True, **loader_kwargs)
++#     holdout_loaders = {}
++#     for name, ds in holdoutsets.items():
++#         shuffle = True if (name == "val" and finetune_on_val) else False
++#         # shuffle = True if (name == "test" and finetune_on_val) else False
++#         holdout_loaders[name] = DataLoader(ds, shuffle=shuffle, **loader_kwargs)
++#     return train_loader, holdout_loaders
++#     # new_holdout_loaders = {}
++#     # new_holdout_loaders["val"] = holdout_loaders["test"]
++#     # new_holdout_loaders["test"] = holdout_loaders["val"]
++#     # return train_loader, new_holdout_loaders
+ 
+ 
+ def get_data_phases(args, finetune_on_val=True):
+     transform_cls = getattr(data, args.data_transform)
+     train_transform = transform_cls(train=True)
+     train_transform_second = getattr(data, args.data_transform_second)(train=True)
+     test_transform = transform_cls(train=False)
+ 
+     dataset_cls = getattr(data, args.dataset)
+     trainset = dataset_cls(basedir=args.data_dir, split="train", transform=train_transform)
+ 
+     holdoutsets = {}
+     for split in ["val", "test"]:
+         transform = train_transform_second if (split == "val"
+                                                and finetune_on_val) else test_transform
+         holdoutsets[split] = dataset_cls(basedir=args.data_dir, split=split, transform=transform)
+ 
+     if args.val_size != -1:
+         print("Using group ratios from train set for validation set")
+         group_ratios = trainset.group_counts / trainset.group_counts.sum()
+         group_ratios = group_ratios / group_ratios.sum()
+         data.subsample_to_size_and_ratio(holdoutsets["val"], args.val_size, group_ratios)
+ 
+     loader_kwargs = {'batch_size': args.batch_size, 'num_workers': 16, 'pin_memory': True}
+     train_loader = DataLoader(trainset, shuffle=True, **loader_kwargs)
+     holdout_loaders = {}
+     for name, ds in holdoutsets.items():
+         shuffle = True if (name == "val" and finetune_on_val) else False
+         holdout_loaders[name] = DataLoader(ds, shuffle=shuffle, **loader_kwargs)
+     return train_loader, holdout_loaders
+ 
+ 
+ def get_data_2_steps(args, finetune_on_val=False):
+     transform_cls = getattr(data, args.data_transform)
+     train_transform = transform_cls(train=True)
+     train_transform_second = getattr(data, args.data_transform_second)(train=True)
+     test_transform = transform_cls(train=False)
+ 
+     dataset_cls = getattr(data, args.dataset)
+     if args.dataset.__contains__("Colored"):
+         dataset_cls = partial(dataset_cls, spurious_correlation=args.cmnist_spurious_corr)
+     trainset = dataset_cls(basedir=args.data_dir, split="train", transform=train_transform)
+ 
+     holdoutsets = {}
+     for split in ["val", "test"]:
+         transform = train_transform if (split == "val" and finetune_on_val) else test_transform
+         holdoutsets[split] = dataset_cls(basedir=args.data_dir, split=split, transform=transform)
+ 
+     if args.pass_n_train > 0:
+         trainset1, trainset2 = make_two_trainsets(trainset, pass_n=args.pass_n_train)
+     trainset2.transform = train_transform_second
+ 
+     if args.val_size != -1:
+         print("Using group ratios from train set for validation set")
+         group_ratios = trainset.group_counts / trainset.group_counts.sum()
+         group_ratios = group_ratios / group_ratios.sum()
+         data.subsample_to_size_and_ratio(holdoutsets["val"], args.val_size, group_ratios)
+ 
+     loader_kwargs = {'batch_size': args.batch_size, 'num_workers': 16, 'pin_memory': True}
+     train_loader = DataLoader(trainset, shuffle=True, **loader_kwargs)
+     train_loader1 = DataLoader(trainset1, shuffle=True, **loader_kwargs)
+     train_loader2 = DataLoader(trainset2, shuffle=True, **loader_kwargs)
+     holdout_loaders = {}
+     for name, ds in holdoutsets.items():
+         shuffle = True if (name == "val" and finetune_on_val) else False
+         holdout_loaders[name] = DataLoader(ds, shuffle=shuffle, **loader_kwargs)
+     train_loaders = (train_loader, train_loader1, train_loader2)
+     return train_loaders, holdout_loaders
+ 
+ 
+ def make_two_trainsets(trainset, pass_n, seed=21):
+     print(trainset.y_array.shape)
+ 
+     ind = np.arange(len(trainset))
+     np.random.seed(seed=seed)
+     np.random.shuffle(ind)
+     ind2 = ind[:pass_n]
+     ind1 = ind[pass_n:]
+     trainset1 = deepcopy(trainset)
+     trainset2 = deepcopy(trainset)
+ 
+     trainset1.y_array = trainset.y_array[ind1]
+     trainset1.group_array = trainset.group_array[ind1]
+     trainset1.spurious_array = trainset.spurious_array[ind1]
+     trainset1.filename_array = trainset.filename_array[ind1]
+     trainset1.metadata_df = trainset.metadata_df.iloc[ind1]
+     trainset1.group_counts = torch.from_numpy(np.bincount(trainset.group_array))
+ 
+     trainset2.y_array = trainset.y_array[ind2]
+     trainset2.group_array = trainset.group_array[ind2]
+     trainset2.spurious_array = trainset.spurious_array[ind2]
+     trainset2.filename_array = trainset.filename_array[ind2]
+     trainset2.metadata_df = trainset.metadata_df.iloc[ind2]
+     trainset2.group_counts = torch.from_numpy(np.bincount(trainset.group_array))
+ 
+     print(trainset1.y_array.shape)
+     print(trainset2.y_array.shape)
+     return trainset1, trainset2
+ 
+ 
+ def pass_data_from_train_to_val(train_data, val_data, pass_n):
+     print(train_data.y_array.shape)
+     print(val_data["val"].y_array.shape)
+ 
+     ind = np.arange(len(train_data))
+     np.random.shuffle(ind)
+     ind1 = ind[:pass_n]
+     ind2 = ind[pass_n:]
+ 
+     aux1 = train_data.y_array[ind1]
+     aux2 = train_data.group_array[ind1]
+     aux3 = train_data.spurious_array[ind1]
+     aux4 = train_data.filename_array[ind1]
+     aux5 = train_data.metadata_df.iloc[ind1]
+ 
+     val_data["val"].y_array = np.concatenate((val_data["val"].y_array, aux1))
+     val_data["val"].group_array = np.concatenate((val_data["val"].group_array, aux2))
+     val_data["val"].spurious_array = np.concatenate((val_data["val"].spurious_array, aux3))
+     val_data["val"].filename_array = np.concatenate((val_data["val"].filename_array, aux4))
+     val_data["val"].metadata_df = pd.concat((val_data["val"].metadata_df, aux5), axis=0)
+     val_data["val"].group_counts = torch.from_numpy(np.bincount(val_data["val"].group_array))
+ 
+     train_data.y_array = train_data.y_array[ind2]
+     train_data.group_array = train_data.group_array[ind2]
+     train_data.spurious_array = train_data.spurious_array[ind2]
+     train_data.filename_array = train_data.filename_array[ind2]
+     train_data.metadata_df = train_data.metadata_df.iloc[ind2]
+     train_data.group_counts = torch.from_numpy(np.bincount(train_data.group_array))
+     print(train_data.y_array.shape)
+     print(val_data["val"].y_array.shape)
+     return train_data, val_data
+ 
+ 
+ def get_train_group_ratios(args):
+     dataset_cls = getattr(data, args.dataset)
+     trainset = dataset_cls(basedir=args.data_dir, split="train", transform=None)
+     group_ratios = trainset.group_counts / trainset.group_counts.sum()
+     return group_ratios
+diff --git utils/supervised_utils.py utils/supervised_utils.py
+index 20bcbf9..4761dfb 100644
+--- utils/supervised_utils.py
++++ utils/supervised_utils.py
+@@ -1,362 +1,431 @@
+ import os
+ import tqdm
+ import pandas as pd
+ import torch
+ import numpy as np
+ from torch.nn import BatchNorm2d
+ from torch.nn import Identity
+ from torch.nn import Linear
+ from torch.nn.utils import clip_grad_norm_
+ import utils
+ from utils import AverageMeter
+ from utils.logging import load_object
+ from utils.logging import save_object
+ from losses import get_exp_weights
+ 
+ _bar_format = '{l_bar}{bar:50}{r_bar}{bar:-10b}'
+ 
+ 
+ def compute_groups_stats(groups, metric):
+     metric = np.array(metric)
+     n_groups = len(np.unique(np.array(groups)))
+     text = ""
+     for i in range(n_groups):
+         mask = groups == i
+         text += f"\nGroup ({i}): "
+         text += f"Q05: {np.quantile(metric[mask], q=0.05):2.5f} | "
+         text += f"Q25: {np.quantile(metric[mask], q=0.25):2.5f} | "
+         text += f"Q50: {np.quantile(metric[mask], q=0.5):2.5f} | "
+         text += f"Q75: {np.quantile(metric[mask], q=0.75):2.5f} | "
+         text += f"Q95: {np.quantile(metric[mask], q=0.95):2.5f} | "
+     print(text)
+ 
+ 
+ def get_dfr_correction(weights, groups):
+     active_groups = groups.unique().tolist()
+     total = 1 / len(active_groups)
+     for g_val in active_groups:
+         mask = groups == g_val
+         weights[mask] = (weights[mask] * total) / weights[mask].sum()
+     return weights
+ 
+ 
+ def normalize_weights(weights):
+     weights /= weights.sum()
+     return weights
+ 
+ 
+ def rebalance_weights(weights, targets):
+     unique_classes = torch.unique(targets)
+     for c in unique_classes:
+         class_count = (targets == c).sum()
+         weights[targets == c] *= len(targets) / class_count
+     return weights.detach()
+ 
+ 
+ def get_last_layer_model(init_weights):
+     w0, b0 = init_weights
+     last_layer = Linear(w0.shape[1], w0.shape[0], bias=True)
+     last_layer.weight.data = w0.clone()
+     last_layer.bias.data = b0.clone()
+     # last_layer.weight.data = classifier.weight.clone()
+     # last_layer.bias.data = classifier.bias.clone()
+     # last_layer.cuda()
+     return last_layer
+ 
+ 
+ def determine_freeze_policy(policy):
+     if policy == "fael":
+         fn = freeze_all_params_except_last_layer
+     elif policy == "faebnl":
+         fn = freeze_all_params_except_last_layer_or_bn
+     elif policy == "fab":
+         fn = freeze_as_beginning
+     elif policy == "lb":
+         fn = freeze_except_last_block
+     else:
+         fn = lambda _: None
+     return fn
+ 
+ 
+ def freeze_except_last_block(model):
+     freeze_all_params(model)
+     for name, param in model.named_parameters():
+         if name.__contains__("layer4.2"):
+             param.requires_grad = True
+     model.fc.weight.requires_grad, model.fc.bias.requires_grad = True, True
+ 
+ 
+ def freeze_all_params_except_last_layer_or_bn(model):
+     freeze_all_params(model)
+     for _, module in model.named_modules():
+         if isinstance(module, BatchNorm2d):
+             module.weight.requires_grad = True
+             module.bias.requires_grad = True
+     model.fc.weight.requires_grad, model.fc.bias.requires_grad = True, True
+ 
+ 
+ def freeze_as_beginning(model):
+     freeze_all_params(model)
+     model.fc.weight.requires_grad = True
+ 
+ 
+ def freeze_all_params_except_last_layer(model):
+     freeze_batchnorm_stats(model)
+     freeze_all_params(model)
+     model.fc.weight.requires_grad, model.fc.bias.requires_grad = True, True
+ 
+ 
+ def freeze_batchnorm_stats(model):
+     for _, module in model.named_modules():
+         if isinstance(module, BatchNorm2d):
+             module.eval()
+ 
+ 
+ def freeze_all_params(model):
+     for param in model.parameters():
+         param.requires_grad = False
+ 
+ 
+ def get_classifier_and_feature_extractor(model):
+     classifier = get_classifier(model)
+     feature_extractor = get_feature_extractor(model)
+     return classifier.eval(), feature_extractor.eval()
+ 
+ 
+ def get_feature_extractor(model):
+     model.fc = Identity()
+     return model
+ 
+ 
+ def get_classifier(model):
+     return model.fc
+ 
+ 
+ @torch.no_grad()
+ def get_all_weights(model, loader, gamma, device):
+     weights = []
+     for batch in loader:
+         x, y, *_ = batch
+         x, y = x.to(device), y.to(device)
+         logits = model(x)
+         weights.append(get_exp_weights(logits, y, gamma).detach().cpu())
+     return torch.cat(weights, axis=0)
+ 
+ 
+ class EmbeddingManager:
+     def __init__(self, device, args):
+         self.device = device
+         self.base_dir = args.base_model_dir
+         self.num_augs = args.num_augs
+         self.reuse_embeddings = args.reuse_embeddings
+         self.save_embeddings = args.save_embeddings
++        self.use_mil = args.use_mil
+ 
+     def get_notebook_embeddings(self, emb_path):
+         print(f'Loading embeddings from {emb_path}')
+         emb_dict = torch.load(emb_path)
+-        embeddings, predictions, y, groups = emb_dict['e'], emb_dict['pred'], emb_dict[
+-            'y'], emb_dict['g']
+-        test_embeddings, test_predictions, test_y, test_groups = emb_dict['test_e'], emb_dict[
+-            'test_pred'], emb_dict['test_y'], emb_dict['test_g']
+-        val_embeddings, val_predictions, val_y, val_groups = emb_dict['val_e'], emb_dict[
+-            'val_pred'], emb_dict['val_y'], emb_dict['val_g']
++        embeddings, predictions, y, groups = emb_dict['e'], emb_dict['pred'], emb_dict['y'], emb_dict['g']
++        test_embeddings, test_predictions, test_y, test_groups = emb_dict['test_e'], emb_dict['test_pred'], emb_dict['test_y'], emb_dict['test_g']
++        val_embeddings, val_predictions, val_y, val_groups = emb_dict['val_e'], emb_dict['val_pred'], emb_dict['val_y'], emb_dict['val_g']
+         out = (embeddings, predictions, groups, y)
+         out_test = (test_embeddings, test_predictions, test_groups, test_y)
+         out_val = (val_embeddings, val_predictions, val_groups, val_y)
+-        # w0, b0 = emb_dict["w0"], emb_dict["b0"]
+         return out, out_test, out_val
+ 
+-    def get_train_test_embeddings(self, classifier, feature_extractor, loaders):
++    def get_train_test_embeddings(self, classifier_or_model, feature_extractor_or_none, loaders):
+         filepath = os.path.join(self.base_dir, "embeddings.pkl")
+-        if (os.path.exists(filepath) and self.reuse_embeddings):
++        if os.path.exists(filepath) and self.reuse_embeddings:
+             print("Found embeddings")
+             out, out_test, out_val = load_object(filepath)
+         else:
+-            print("Computings embeddings")
+-            out, out_test, out_val = self._get_train_test_embeddings(classifier, feature_extractor,
+-                                                                     loaders)
++            print("Computing embeddings")
++            if self.use_mil:
++                out = get_embeddings_and_rest_mil(classifier_or_model, loaders[0], self.device)
++                out_test = get_embeddings_and_rest_mil(classifier_or_model, loaders[1]["test"], self.device)
++                out_val = get_embeddings_and_rest_mil(classifier_or_model, loaders[1]["val"], self.device)
++            else:
++                out = get_embeddings_and_rest_standard(
++                    classifier_or_model, feature_extractor_or_none, loaders[0],
++                    num_augs=self.num_augs, device=self.device
++                )
++                out_test = get_embeddings_and_rest_standard(
++                    classifier_or_model, feature_extractor_or_none, loaders[1]["test"],
++                    num_augs=self.num_augs, device=self.device
++                )
++                out_val = get_embeddings_and_rest_standard(
++                    classifier_or_model, feature_extractor_or_none, loaders[1]["val"],
++                    num_augs=self.num_augs, device=self.device
++                )
+             if self.save_embeddings:
+                 print("Saving embeddings")
+                 save_object((out, out_test, out_val), filepath)
++
+         out = self.place_in_device(out)
+         out_test = self.place_in_device(out_test)
+         out_val = self.place_in_device(out_val)
+         return out, out_test, out_val
+ 
+     def place_in_device(self, out):
+-        new = tuple([element.to(self.device) for element in out])
+-        return new
+-
+-    def _get_train_test_embeddings(self, classifier, feature_extractor, loaders):
+-        train_loader, holdout_loaders = loaders
+-        val_loader, test_loader = holdout_loaders["val"], holdout_loaders["test"]
+-        out = get_embeddings_and_rest(classifier, feature_extractor, train_loader,
+-                                      num_augs=self.num_augs, device=self.device)
+-        out_test = get_embeddings_and_rest(classifier, feature_extractor, test_loader,
+-                                           num_augs=self.num_augs, device=self.device)
+-        out_val = get_embeddings_and_rest(classifier, feature_extractor, val_loader,
+-                                          num_augs=self.num_augs, device=self.device)
+-        return out, out_test, out_val
++        return tuple([element.to(self.device) for element in out])
++
++@torch.no_grad()
++def get_embeddings_and_rest_mil(model, loader, device):
++    embeddings, preds, groups, labels = [], [], [], []
++    model.eval()
++    for batch in loader:
++        bag = batch["bag"].to(device)
++        group = batch["group"].to(device)
++        label = batch["label"].to(device)
++
++        embedding = model.get_embeddings(bag)
++        logits = model.classifier(embedding)
+ 
++        embeddings.append(embedding)
++        preds.append(torch.argmax(logits, dim=1))
++        groups.append(group)
++        labels.append(label)
++
++    return (
++        torch.cat(embeddings, dim=0),
++        torch.cat(preds, dim=0),
++        torch.cat(groups, dim=0),
++        torch.cat(labels, dim=0),
++    )
+ 
+ @torch.no_grad()
+-def get_embeddings_and_rest(classifier, feature_extractor, loader, num_augs, device):
++def get_embeddings_and_rest_standard(classifier, feature_extractor, loader, num_augs, device):
+     embeddings, predictions, targets, groups = [], [], [], []
+     for _ in range(num_augs):
+         for batch in loader:
+             x, y, group, *_ = batch
+             x, y = x.to(device), y.to(device)
+             z = feature_extractor(x)
+             logits = classifier(z)
+             predictions.append(torch.argmax(logits.detach().cpu(), axis=1))
+             embeddings.append(z.detach().cpu())
+             groups.append(group.detach().cpu())
+             targets.append(y.detach().cpu())
+-    embeddings = torch.cat(embeddings, axis=0)
+-    predictions = torch.cat(predictions, axis=0)
+-    groups = torch.cat(groups, axis=0)
+-    targets = torch.cat(targets, axis=0)
+-    return embeddings, predictions, groups, targets
++    return (
++        torch.cat(embeddings, axis=0),
++        torch.cat(predictions, axis=0),
++        torch.cat(groups, axis=0),
++        torch.cat(targets, axis=0),
++    )
++
++
++@torch.no_grad()
++def get_embeddings_and_rest(model, loader, device):
++    embeddings, preds, groups, labels = [], [], [], []
++    model.eval()
++    for batch in loader:
++        bag = batch["bag"].to(device)               # [B, N, C, H, W]
++        group = batch["group"].to(device)
++        label = batch["label"].to(device)
++
++        # 💡 use the new get_embeddings method
++        embedding = model.get_embeddings(bag)       # [B, D]
++        logits = model.classifier(embedding)        # [B, num_classes]
++
++        embeddings.append(embedding)
++        preds.append(torch.argmax(logits, dim=1))
++        groups.append(group)
++        labels.append(label)
++
++    return (
++        torch.cat(embeddings, dim=0),
++        torch.cat(preds, dim=0),
++        torch.cat(groups, dim=0),
++        torch.cat(labels, dim=0),
++    )
++
++# def get_embeddings_and_rest(classifier, feature_extractor, loader, num_augs, device):
++#     embeddings, predictions, targets, groups = [], [], [], []
++#     for _ in range(num_augs):
++#         for batch in loader:
++#             x, y, group, *_ = batch
++#             x, y = x.to(device), y.to(device)
++#             z = feature_extractor(x)
++#             logits = classifier(z)
++#             predictions.append(torch.argmax(logits.detach().cpu(), axis=1))
++#             embeddings.append(z.detach().cpu())
++#             groups.append(group.detach().cpu())
++#             targets.append(y.detach().cpu())
++#     embeddings = torch.cat(embeddings, axis=0)
++#     predictions = torch.cat(predictions, axis=0)
++#     groups = torch.cat(groups, axis=0)
++#     targets = torch.cat(targets, axis=0)
++#     return embeddings, predictions, groups, targets
+ 
+ 
+ def take_step_multi(gating_model, model1, model2, data, optimizer, criterion, scheduler,
+                     max_norm=-1):
+     embeddings, targets, weights = data
+     optimizer.zero_grad()
+     # rho = gating_model(embeddings)
+     rho = gating_model(embeddings)**2.
+     logits = rho * (model1(embeddings)) + (1 - rho) * (model2(embeddings))
+     loss = criterion(logits, targets, weights)
+     loss.backward()
+     if max_norm > 0:
+         clip_grad_norm_(gating_model.parameters(), max_norm=max_norm)
+     optimizer.step()
+     if scheduler is not None:
+         scheduler.step()
+     return loss, logits
+ 
+ 
+ def take_step(model, data, optimizer, criterion, scheduler, init_weights, reg_coeff, max_norm=-1):
+     w0, b0 = init_weights
+     embeddings, targets, weights = data
+     optimizer.zero_grad()
+     logits = model(embeddings)
+     loss = criterion(logits, targets, weights)
+     reg = ((model.weight - w0).pow(2).sum() + (model.bias - b0).pow(2).sum())
+     loss += reg_coeff * reg
+     loss.backward()
+     if max_norm > 0:
+         clip_grad_norm_(model.parameters(), max_norm=max_norm)
+     optimizer.step()
+     if scheduler is not None:
+         scheduler.step()
+     return loss, logits
+ 
+ 
+ def train_epoch_multiple(model, loaders, optimizer, criterion, device, counter, policy=None):
+     model.train()
+     if policy is not None:
+         policy(model)
+     loss_meter = AverageMeter()
+     n_groups = loaders[0].dataset.n_groups
+     acc_groups = {g_idx: AverageMeter() for g_idx in range(n_groups)}
+     shrinked, counter = iter(loaders[-1]), 0
+ 
+     for batch in (pbar := tqdm.tqdm(loaders[0], bar_format=_bar_format)):
+         x1, y1, group1, *_ = batch
+         x1, y1 = x1.to(device), y1.to(device)
+         empty = True if counter == len(shrinked) else False
+         if empty:
+             shrinked, counter = iter(loaders[-1]), 0
+         batch2 = next(shrinked)
+         counter += 1
+         x2, y2, group2, *_ = batch2
+         x2, y2 = x2.to(device), y2.to(device)
+         X = torch.concat((x1, x2))
+         Y = torch.concat((y1, y2))
+         group = torch.concat((group1, group2))
+ 
+         optimizer.zero_grad()
+         logits = model(X)
+         loss = criterion(logits, Y, counter)
+         loss.backward()
+         optimizer.step()
+ 
+         loss_meter.update(loss, X.size(0))
+ 
+         preds = torch.argmax(logits, dim=1)
+         utils.update_dict(acc_groups, Y, group, logits)
+         acc = (preds == Y).float().mean()
+ 
+         text = f"Loss: {loss.item():3f} ({loss_meter.avg:.3f}); Acc: {acc:3f}"
+         pbar.set_description(text)
+ 
+     return loss_meter, acc_groups
+ 
+ 
+ def train_epoch(model, loader, optimizer, criterion, device, counter, policy=None,
+                 max_grad_norm=-1.0):
+     model.train()
+     if policy is not None:
+         policy(model)
+     loss_meter = AverageMeter()
+     # n_groups = loader.dataset.n_groups
+     # acc_groups = {g_idx: AverageMeter() for g_idx in range(n_groups)}
+     acc_groups = {g_idx: AverageMeter() for g_idx in loader.dataset.active_groups}
+ 
+     for batch in (pbar := tqdm.tqdm(loader, bar_format=_bar_format)):
+         x, y, group, *_ = batch
+         x, y = x.to(device), y.to(device)
+ 
+         optimizer.zero_grad()
+         logits = model(x)
+         loss = criterion(logits, y, counter)
+         loss.backward()
+         if max_grad_norm > 0:
+             clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+         optimizer.step()
+ 
+         loss_meter.update(loss, x.size(0))
+         preds = torch.argmax(logits, dim=1)
+ 
+         utils.update_dict(acc_groups, y, group, logits)
+         acc = (preds == y).float().mean()
+         text = f"Loss: {loss.item():3f} ({loss_meter.avg:.3f}); Acc: {acc:3f}"
+         pbar.set_description(text)
+ 
+     return loss_meter, acc_groups
+ 
+ 
+ @torch.no_grad()
+ def get_img_predictions(model, loader, device):
+     model.eval()
+     imgs, ys, preds = [], [], []
+     for batch in tqdm.tqdm(loader, bar_format=_bar_format):
+         x, y, *_, img_path = batch
+         x, y = x.to(device), y.to(device)
+         logits = model(x)
+         pred = torch.argmax(logits, axis=1)
+         imgs += img_path
+         ys.append(y.cpu())
+         preds.append(pred.cpu())
+     predictions_df = {
+         'imgs': imgs,
+         'preds': torch.concat(preds, axis=0),
+         'ys': torch.concat(ys, axis=0)
+     }
+     return pd.DataFrame(predictions_df)
+ 
+ 
+ def eval_model(model, test_loader_dict, device):
+     model.eval()
+     results_dict = {}
+     with torch.no_grad():
+         for test_name, test_loader in test_loader_dict.items():
+             acc_groups = {g_idx: AverageMeter() for g_idx in test_loader.dataset.active_groups}
+             for batch in tqdm.tqdm(test_loader, bar_format=_bar_format):
+                 x, y, group, *_ = batch
+                 x, y = x.to(device), y.to(device)
+                 logits = model(x)
+                 utils.update_dict(acc_groups, y, group, logits)
+             results_dict[test_name] = acc_groups
+     return results_dict

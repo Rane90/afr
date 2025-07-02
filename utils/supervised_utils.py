@@ -150,57 +150,81 @@ class EmbeddingManager:
         self.num_augs = args.num_augs
         self.reuse_embeddings = args.reuse_embeddings
         self.save_embeddings = args.save_embeddings
+        self.use_mil = args.use_mil
 
     def get_notebook_embeddings(self, emb_path):
         print(f'Loading embeddings from {emb_path}')
         emb_dict = torch.load(emb_path)
-        embeddings, predictions, y, groups = emb_dict['e'], emb_dict['pred'], emb_dict[
-            'y'], emb_dict['g']
-        test_embeddings, test_predictions, test_y, test_groups = emb_dict['test_e'], emb_dict[
-            'test_pred'], emb_dict['test_y'], emb_dict['test_g']
-        val_embeddings, val_predictions, val_y, val_groups = emb_dict['val_e'], emb_dict[
-            'val_pred'], emb_dict['val_y'], emb_dict['val_g']
+        embeddings, predictions, y, groups = emb_dict['e'], emb_dict['pred'], emb_dict['y'], emb_dict['g']
+        test_embeddings, test_predictions, test_y, test_groups = emb_dict['test_e'], emb_dict['test_pred'], emb_dict['test_y'], emb_dict['test_g']
+        val_embeddings, val_predictions, val_y, val_groups = emb_dict['val_e'], emb_dict['val_pred'], emb_dict['val_y'], emb_dict['val_g']
         out = (embeddings, predictions, groups, y)
         out_test = (test_embeddings, test_predictions, test_groups, test_y)
         out_val = (val_embeddings, val_predictions, val_groups, val_y)
-        # w0, b0 = emb_dict["w0"], emb_dict["b0"]
         return out, out_test, out_val
 
-    def get_train_test_embeddings(self, classifier, feature_extractor, loaders):
+    def get_train_test_embeddings(self, classifier_or_model, feature_extractor_or_none, loaders):
         filepath = os.path.join(self.base_dir, "embeddings.pkl")
-        if (os.path.exists(filepath) and self.reuse_embeddings):
+        if os.path.exists(filepath) and self.reuse_embeddings:
             print("Found embeddings")
             out, out_test, out_val = load_object(filepath)
         else:
-            print("Computings embeddings")
-            out, out_test, out_val = self._get_train_test_embeddings(classifier, feature_extractor,
-                                                                     loaders)
+            print("Computing embeddings")
+            if self.use_mil:
+                out = get_embeddings_and_rest_mil(classifier_or_model, loaders[0], self.device)
+                out_test = get_embeddings_and_rest_mil(classifier_or_model, loaders[1]["test"], self.device)
+                out_val = get_embeddings_and_rest_mil(classifier_or_model, loaders[1]["val"], self.device)
+            else:
+                out = get_embeddings_and_rest_standard(
+                    classifier_or_model, feature_extractor_or_none, loaders[0],
+                    num_augs=self.num_augs, device=self.device
+                )
+                out_test = get_embeddings_and_rest_standard(
+                    classifier_or_model, feature_extractor_or_none, loaders[1]["test"],
+                    num_augs=self.num_augs, device=self.device
+                )
+                out_val = get_embeddings_and_rest_standard(
+                    classifier_or_model, feature_extractor_or_none, loaders[1]["val"],
+                    num_augs=self.num_augs, device=self.device
+                )
             if self.save_embeddings:
                 print("Saving embeddings")
                 save_object((out, out_test, out_val), filepath)
+
         out = self.place_in_device(out)
         out_test = self.place_in_device(out_test)
         out_val = self.place_in_device(out_val)
         return out, out_test, out_val
 
     def place_in_device(self, out):
-        new = tuple([element.to(self.device) for element in out])
-        return new
-
-    def _get_train_test_embeddings(self, classifier, feature_extractor, loaders):
-        train_loader, holdout_loaders = loaders
-        val_loader, test_loader = holdout_loaders["val"], holdout_loaders["test"]
-        out = get_embeddings_and_rest(classifier, feature_extractor, train_loader,
-                                      num_augs=self.num_augs, device=self.device)
-        out_test = get_embeddings_and_rest(classifier, feature_extractor, test_loader,
-                                           num_augs=self.num_augs, device=self.device)
-        out_val = get_embeddings_and_rest(classifier, feature_extractor, val_loader,
-                                          num_augs=self.num_augs, device=self.device)
-        return out, out_test, out_val
-
+        return tuple([element.to(self.device) for element in out])
 
 @torch.no_grad()
-def get_embeddings_and_rest(classifier, feature_extractor, loader, num_augs, device):
+def get_embeddings_and_rest_mil(model, loader, device):
+    embeddings, preds, groups, labels = [], [], [], []
+    model.eval()
+    for batch in loader:
+        bag = batch["bag"].to(device)
+        group = batch["group"].to(device)
+        label = batch["label"].to(device)
+
+        embedding = model.get_embeddings(bag)
+        logits = model.classifier(embedding)
+
+        embeddings.append(embedding)
+        preds.append(torch.argmax(logits, dim=1))
+        groups.append(group)
+        labels.append(label)
+
+    return (
+        torch.cat(embeddings, dim=0),
+        torch.cat(preds, dim=0),
+        torch.cat(groups, dim=0),
+        torch.cat(labels, dim=0),
+    )
+
+@torch.no_grad()
+def get_embeddings_and_rest_standard(classifier, feature_extractor, loader, num_augs, device):
     embeddings, predictions, targets, groups = [], [], [], []
     for _ in range(num_augs):
         for batch in loader:
@@ -212,11 +236,56 @@ def get_embeddings_and_rest(classifier, feature_extractor, loader, num_augs, dev
             embeddings.append(z.detach().cpu())
             groups.append(group.detach().cpu())
             targets.append(y.detach().cpu())
-    embeddings = torch.cat(embeddings, axis=0)
-    predictions = torch.cat(predictions, axis=0)
-    groups = torch.cat(groups, axis=0)
-    targets = torch.cat(targets, axis=0)
-    return embeddings, predictions, groups, targets
+    return (
+        torch.cat(embeddings, axis=0),
+        torch.cat(predictions, axis=0),
+        torch.cat(groups, axis=0),
+        torch.cat(targets, axis=0),
+    )
+
+
+@torch.no_grad()
+def get_embeddings_and_rest(model, loader, device):
+    embeddings, preds, groups, labels = [], [], [], []
+    model.eval()
+    for batch in loader:
+        bag = batch["bag"].to(device)               # [B, N, C, H, W]
+        group = batch["group"].to(device)
+        label = batch["label"].to(device)
+
+        # 💡 use the new get_embeddings method
+        embedding = model.get_embeddings(bag)       # [B, D]
+        logits = model.classifier(embedding)        # [B, num_classes]
+
+        embeddings.append(embedding)
+        preds.append(torch.argmax(logits, dim=1))
+        groups.append(group)
+        labels.append(label)
+
+    return (
+        torch.cat(embeddings, dim=0),
+        torch.cat(preds, dim=0),
+        torch.cat(groups, dim=0),
+        torch.cat(labels, dim=0),
+    )
+
+# def get_embeddings_and_rest(classifier, feature_extractor, loader, num_augs, device):
+#     embeddings, predictions, targets, groups = [], [], [], []
+#     for _ in range(num_augs):
+#         for batch in loader:
+#             x, y, group, *_ = batch
+#             x, y = x.to(device), y.to(device)
+#             z = feature_extractor(x)
+#             logits = classifier(z)
+#             predictions.append(torch.argmax(logits.detach().cpu(), axis=1))
+#             embeddings.append(z.detach().cpu())
+#             groups.append(group.detach().cpu())
+#             targets.append(y.detach().cpu())
+#     embeddings = torch.cat(embeddings, axis=0)
+#     predictions = torch.cat(predictions, axis=0)
+#     groups = torch.cat(groups, axis=0)
+#     targets = torch.cat(targets, axis=0)
+#     return embeddings, predictions, groups, targets
 
 
 def take_step_multi(gating_model, model1, model2, data, optimizer, criterion, scheduler,

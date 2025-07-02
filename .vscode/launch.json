@@ -1,0 +1,81 @@
+// {
+//     "version": "0.2.0",
+//     "configurations": [
+//         {
+//             "name": "Debug train_embeddings.py",
+//             "type": "debugpy",
+//             "request": "launch",
+//             "program": "${workspaceFolder}/train_embeddings.py",
+//             "console": "integratedTerminal",
+//             "args": [
+//                 "--dataset", "masked_bag_waterbirds",
+//                 "--data_dir", "/dsi/scratch/users/eisenbr2/waterbird_complete95_forest2water2",
+//                 "--model", "MILAttentionModel",
+//                 "--num_epochs", "5",
+//                 "--masking_strategy", "mean_fill_dilation",
+//                 "--include_original",
+//                 "--gradual_shrink", "True",
+//                 "--output_dir", "logs/waterbirds/emb",
+//                 "--base_model_dir", "logs/waterbirds/80_0",
+//                 "--num_epochs", "500",
+//                 "--batch_size", "128",
+//                 "--emb_batch_size", "-1",
+//                 "--optimizer", "sgd_optimizer",
+//                 "--scheduler", "constant_lr_scheduler",
+//                 "--init_lr", "0.01",
+//                 "--momentum", "0.",
+//                 "--weight_decay", "0.",
+//                 "--loss", "afr",
+//                 "--tune_on", "train",
+//                 "--train_prop", "-20",
+//                 "--gamma", "10",
+//                 "--num_augs", "1",
+//                 "--grad_norm", "1.0",
+//                 "--reg_coeff", "0.0"
+//             ],
+//             "env": {
+//                 "CUDA_VISIBLE_DEVICES": "3"
+//             }
+//         }
+//     ]
+// }
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug train_embeddings.py (waterbirds)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/train_embeddings.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--use_wandb",
+                "--output_dir", "logs/waterbirds/emb",
+                "--project", "waterbirds",
+                "--seed", "0",
+                "--base_model_dir", "logs/waterbirds/80_0",
+                "--model", "imagenet_resnet50_pretrained",
+                "--data_dir", "/dsi/scratch/users/eisenbr2/waterbird_complete95_forest2water2",
+                "--data_transform", "NoAugWaterbirdsCelebATransform",
+                "--num_epochs", "500",
+                "--batch_size", "128",
+                "--emb_batch_size", "-1",
+                "--optimizer", "sgd_optimizer",
+                "--scheduler", "constant_lr_scheduler",
+                "--init_lr", "0.01",
+                "--momentum", "0.",
+                "--weight_decay", "0.",
+                "--loss", "afr",
+                "--tune_on", "train",
+                "--train_prop", "-20",
+                "--gamma", "10",
+                "--num_augs", "1",
+                "--grad_norm", "1.0",
+                "--reg_coeff", "0.0"
+            ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "3"
+            }
+        }
+    ]
+}

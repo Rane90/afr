@@ -51,14 +51,31 @@ def proportion(num):
         return num
 
 
-def get_embeddings_loader(emb_batch_size, embeddings, targets, weights):
+# def get_embeddings_loader(emb_batch_size, embeddings, targets, weights):
+#     if emb_batch_size > 0:
+#         ds = EmbeddingsDataset(embeddings=embeddings, targets=targets, weights=weights)
+#         batch_size = emb_batch_size if emb_batch_size > 0 else len(targets)
+#         loader = DataLoader(ds, batch_size=batch_size, shuffle=True)
+#     else:
+#         loader = [(embeddings, targets, weights)]
+#     return loader
+
+def get_embeddings_loader(emb_batch_size, embeddings, targets, weights, bag_embeddings=None, concepts=None, clip_scores=None):
     if emb_batch_size > 0:
-        ds = EmbeddingsDataset(embeddings=embeddings, targets=targets, weights=weights)
+        ds = EmbeddingsDataset(
+            embeddings=embeddings,
+            targets=targets,
+            weights=weights,
+            bag_embeddings=bag_embeddings,
+            concepts=concepts,
+            clip_scores=clip_scores
+        )
         batch_size = emb_batch_size if emb_batch_size > 0 else len(targets)
         loader = DataLoader(ds, batch_size=batch_size, shuffle=True)
     else:
-        loader = [(embeddings, targets, weights)]
+        loader = [(embeddings, targets, weights, bag_embeddings, concepts, clip_scores)]
     return loader
+
 
 
 def determine_dfr_train_eval_loaders(tune_on, train_loader, holdout_loaders):
@@ -76,8 +93,8 @@ def set_seed(seed):
         torch.cuda.manual_seed(seed)
     torch.manual_seed(seed)
     np.random.seed(seed)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
 
 
 def initialize_logger(args):
@@ -138,7 +155,7 @@ def get_default_args():
     parser.add_argument("--model", type=str, required=True, help="base model")
     parser.add_argument(
         "--loss", type=str, default="cross_entropy", choices=[
-            "cross_entropy",
+            "cross_entropy", "focal_loss"
         ])
     parser.add_argument("--data_dir", type=str, required=True, help="Train dataset directory")
     parser.add_argument("--train_prop", type=proportion, default=1)
@@ -171,6 +188,7 @@ def get_default_args():
     parser.add_argument(
         "--dataset", type=str, required=False, default="SpuriousDataset", choices=[
             "SpuriousDataset",
+            "SpuriousWithMasksDataset",
             "SpuriousCIFAR10",
             "MultiNLIDataset",
             "FakeSpuriousCIFAR10",
@@ -206,6 +224,7 @@ def get_default_args():
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--init_lr", type=float, default=0.1)
     parser.add_argument("--gamma", type=float, default=0)
+    parser.add_argument("--alpha_focal", type=float, default=None)
     parser.add_argument("--gradient_starv_lam", type=float, default=0)
     parser.add_argument("--reweight_groups", action='store_true', help="reweight groups")
     parser.add_argument("--reweight_classes", action='store_true', help="reweight classes")
@@ -223,6 +242,21 @@ def get_default_args():
         ])
     parser.add_argument("--tune_on", type=str, default="train")
     parser.add_argument("--grad_norm", type=float, default=-1.)
+
+    ### MIL
+    parser.add_argument("--use_mask_wrapper", type=str2bool, default=False, help="Wrap dataset to include masked bag info")
+    parser.add_argument("--mask_data_root", type=str, default=None, help="Path to JSON cache and masks for WaterbirdsDistanceMaskDataset")
+    parser.add_argument("--masking_strategy", type=str, default="mean_fill_dilation", help="Masking strategy")
+    parser.add_argument("--max_distance", type=float, default=30.0, help="Max distance for mask dilation")
+    parser.add_argument("--alpha", type=float, default=0.1, help="Alpha value for dilation masking")
+    parser.add_argument("--gradual_shrink", type=str2bool, default=False)
+    parser.add_argument("--current_epoch", type=int, default=0)
+    parser.add_argument("--total_epochs", type=int, default=20)
+    parser.add_argument("--bag_size", type=int, default=5)
+    parser.add_argument("--clip_dim", type=int, default=512)
+    parser.add_argument("--mask_crop_scale", type=float, nargs=2, default=(0.85, 1.0), help="Crop scale tuple")
+    parser.add_argument("--lambda_concept", type=float, default=0.5, help="lambda_concept")
+    
     return parser
 
 
@@ -259,6 +293,7 @@ def get_minimal_args():
     parser.add_argument(
         "--dataset", type=str, required=False, default="SpuriousDataset", choices=[
             "SpuriousDataset",
+            "SpuriousWithMasksDataset",
             "Camelyon17",
             "MultiNLIDataset",
             "SpuriousCIFAR10",
@@ -336,6 +371,20 @@ def get_embeddings_args():
     parser.add_argument("--val_size", type=int, default=-1)
     parser.add_argument("--batch_size", type=int, default=100)
     parser.add_argument("--emb_batch_size", type=int, default=-1)
+
+    # MIL
+    parser.add_argument("--use_mask_wrapper", type=str2bool, default=False, help="Wrap dataset to include masked bag info")
+    parser.add_argument("--mask_data_root", type=str, default=None, help="Path to JSON cache and masks for WaterbirdsDistanceMaskDataset")
+    parser.add_argument("--masking_strategy", type=str, default="mean_fill_dilation", help="Masking strategy")
+    parser.add_argument("--max_distance", type=float, default=30.0, help="Max distance for mask dilation")
+    parser.add_argument("--alpha", type=float, default=0.1, help="Alpha value for dilation masking")
+    parser.add_argument("--gradual_shrink", type=str2bool, default=False)
+    parser.add_argument("--current_epoch", type=int, default=0)
+    parser.add_argument("--total_epochs", type=int, default=20)
+    parser.add_argument("--bag_size", type=int, default=5)
+    parser.add_argument("--clip_dim", type=int, default=512)
+    parser.add_argument("--mask_crop_scale", type=float, nargs=2, default=(0.85, 1.0), help="Crop scale tuple")
+    parser.add_argument("--lambda_concept", type=float, default=0.5, help="lambda_concept")
     return parser
 
 
@@ -411,24 +460,68 @@ def get_data(args, finetune_on_val=False):
     train_transform = transform_cls(train=True)
     test_transform = transform_cls(train=False)
 
-    dataset_cls = getattr(data, args.dataset)
-    if args.dataset.__contains__("Colored"):
-        dataset_cls = partial(dataset_cls, spurious_correlation=args.cmnist_spurious_corr)
-    trainset = dataset_cls(basedir=args.data_dir, split="train", transform=train_transform,
-                           prop=args.train_prop, max_prop=args.max_prop)
+    is_wrapped = args.dataset == "SpuriousWithMasksDataset"
+    if is_wrapped:
+        base_dataset_cls = getattr(data, "SpuriousDataset")
+        wrapper_cls = getattr(data, "SpuriousWithMasksDataset")
+        mask_kwargs = dict(
+            masking_strategy=args.masking_strategy,
+            max_distance=args.max_distance,
+            alpha=args.alpha,
+            crop_scale=tuple(args.mask_crop_scale),
+            gradual_shrink=args.gradual_shrink,
+            current_epoch=args.current_epoch,
+            total_epochs=args.total_epochs,
+        )
+    else:
+        dataset_cls = getattr(data, args.dataset)
+        if args.dataset.__contains__("Colored"):
+            dataset_cls = partial(dataset_cls, spurious_correlation=args.cmnist_spurious_corr)
 
+    # ===== Load training set =====
+    if is_wrapped:
+        base_train = base_dataset_cls(
+            basedir=args.data_dir, split="train", transform=train_transform,
+            prop=args.train_prop, max_prop=args.max_prop
+        )
+        trainset = wrapper_cls(
+            spurious_dataset=base_train,
+            mask_data_root=args.data_dir,
+            split="train",
+            **mask_kwargs
+        )
+    else:
+        trainset = dataset_cls(
+            basedir=args.data_dir, split="train", transform=train_transform,
+            prop=args.train_prop, max_prop=args.max_prop
+        )
+
+    # ===== Load holdout sets (val/test) =====
     holdoutsets = {}
     for split in ["val", "test"]:
         transform = train_transform if (split == "val" and finetune_on_val) else test_transform
-        # transform = train_transform if (split == "test" and finetune_on_val) else test_transform
         prop = 1 if split == "test" else args.val_prop
-        holdoutsets[split] = dataset_cls(basedir=args.data_dir, split=split, transform=transform,
-                                         prop=prop)
 
+        if is_wrapped:
+            base_holdout = base_dataset_cls(
+                basedir=args.data_dir, split=split, transform=transform, prop=prop
+            )
+            holdoutsets[split] = wrapper_cls(
+                spurious_dataset=base_holdout,
+                mask_data_root=args.data_dir,
+                split=split,
+                **mask_kwargs
+            )
+        else:
+            holdoutsets[split] = dataset_cls(
+                basedir=args.data_dir, split=split, transform=transform, prop=prop
+            )
+
+    # ===== Optional: pass samples from train to val =====
     if args.pass_n > 0:
-        trainset, holdoutsets = pass_data_from_train_to_val(trainset, holdoutsets,
-                                                            pass_n=args.pass_n)
+        trainset, holdoutsets = pass_data_from_train_to_val(trainset, holdoutsets, pass_n=args.pass_n)
 
+    # ===== Optional: subsample validation set =====
     if args.val_size != -1:
         print(f"Using only {args.val_size} samples of val data")
         if args.balance_val:
@@ -439,24 +532,117 @@ def get_data(args, finetune_on_val=False):
             group_ratios = trainset.group_counts / trainset.group_counts.sum()
             group_ratios = group_ratios / group_ratios.sum()
         data.subsample_to_size_and_ratio(holdoutsets["val"], args.val_size, group_ratios)
-        # data.subsample_to_size_and_ratio(holdoutsets["test"], args.val_size, group_ratios)
 
-    # collate_fn = data.get_collate_fn(mixup=False, num_classes=trainset.n_classes)
-    loader_kwargs = {'batch_size': args.batch_size, 'num_workers': 16, 'pin_memory': True}
-    # sampler = data.get_sampler(trainset, args)
-    # train_loader = DataLoader(trainset, shuffle=True, sampler=sampler, collate_fn=collate_fn,
-    #                           **loader_kwargs)
-    train_loader = DataLoader(trainset, shuffle=True, **loader_kwargs)
+    # ===== Dataloaders =====
+    loader_kwargs = {'batch_size': args.batch_size, 'num_workers': 8, 'pin_memory': True}
+    # loader_kwargs = {'batch_size': args.batch_size, 'num_workers': 1, 'pin_memory': True}
+
+    if is_wrapped:
+        collate_fn = collate_fn_for_masked_spurious
+    else:
+        collate_fn = None  # default
+
+    train_loader = DataLoader(trainset, shuffle=True, collate_fn=collate_fn, **loader_kwargs)
+
     holdout_loaders = {}
     for name, ds in holdoutsets.items():
         shuffle = True if (name == "val" and finetune_on_val) else False
-        # shuffle = True if (name == "test" and finetune_on_val) else False
-        holdout_loaders[name] = DataLoader(ds, shuffle=shuffle, **loader_kwargs)
+        holdout_loaders[name] = DataLoader(ds, shuffle=shuffle, collate_fn=collate_fn, **loader_kwargs)
+
+
     return train_loader, holdout_loaders
-    # new_holdout_loaders = {}
-    # new_holdout_loaders["val"] = holdout_loaders["test"]
-    # new_holdout_loaders["test"] = holdout_loaders["val"]
-    # return train_loader, new_holdout_loaders
+
+def collate_fn_for_masked_spurious(batch):
+    # Unpack: x, y, group, is_spurious, file_path, img_tensor, masked_bag, concepts, clip_scores, raw_bag
+    xs, ys, groups, spurious_flags, paths, img_tensors, masked_bags, concepts, clip_scores, raw_bags = zip(*batch)
+
+    # Pad bags to same number of segments (if needed)
+    max_instances = max(b.shape[0] for b in masked_bags)
+    padded_masked_bags = []
+    padded_raw_bags = []
+    padded_concepts = []
+    padded_clip_scores = []
+
+    for bag, raw, c, s in zip(masked_bags, raw_bags, concepts, clip_scores):
+        pad_size = max_instances - bag.shape[0]
+
+        if pad_size > 0:
+            pad_tensor = torch.zeros((pad_size, *bag.shape[1:]), dtype=bag.dtype)
+            bag = torch.cat([bag, pad_tensor], dim=0)
+            raw = torch.cat([raw, pad_tensor], dim=0)
+            c += [["<PAD>"]] * pad_size
+            s += [{}] * pad_size
+
+        padded_masked_bags.append(bag)
+        padded_raw_bags.append(raw)
+        padded_concepts.append(c)
+        padded_clip_scores.append(s)
+
+    return (
+        torch.stack(xs),
+        torch.tensor(ys),
+        torch.tensor(groups),
+        torch.tensor(spurious_flags),
+        list(paths),
+        torch.stack(img_tensors),
+        torch.stack(padded_masked_bags),
+        padded_concepts,
+        padded_clip_scores,
+        torch.stack(padded_raw_bags),
+    )
+
+
+# def get_data(args, finetune_on_val=False):
+#     transform_cls = getattr(data, args.data_transform)
+#     train_transform = transform_cls(train=True)
+#     test_transform = transform_cls(train=False)
+
+#     dataset_cls = getattr(data, args.dataset)
+#     if args.dataset.__contains__("Colored"):
+#         dataset_cls = partial(dataset_cls, spurious_correlation=args.cmnist_spurious_corr)
+#     trainset = dataset_cls(basedir=args.data_dir, split="train", transform=train_transform,
+#                            prop=args.train_prop, max_prop=args.max_prop)
+
+#     holdoutsets = {}
+#     for split in ["val", "test"]:
+#         transform = train_transform if (split == "val" and finetune_on_val) else test_transform
+#         # transform = train_transform if (split == "test" and finetune_on_val) else test_transform
+#         prop = 1 if split == "test" else args.val_prop
+#         holdoutsets[split] = dataset_cls(basedir=args.data_dir, split=split, transform=transform,
+#                                          prop=prop)
+
+#     if args.pass_n > 0:
+#         trainset, holdoutsets = pass_data_from_train_to_val(trainset, holdoutsets,
+#                                                             pass_n=args.pass_n)
+
+#     if args.val_size != -1:
+#         print(f"Using only {args.val_size} samples of val data")
+#         if args.balance_val:
+#             print("Using balanced group ratios for validation set")
+#             group_ratios = np.array([1 / 4] * 4)
+#         else:
+#             print("Using group ratios from train set for validation set")
+#             group_ratios = trainset.group_counts / trainset.group_counts.sum()
+#             group_ratios = group_ratios / group_ratios.sum()
+#         data.subsample_to_size_and_ratio(holdoutsets["val"], args.val_size, group_ratios)
+#         # data.subsample_to_size_and_ratio(holdoutsets["test"], args.val_size, group_ratios)
+
+#     # collate_fn = data.get_collate_fn(mixup=False, num_classes=trainset.n_classes)
+#     loader_kwargs = {'batch_size': args.batch_size, 'num_workers': 16, 'pin_memory': True}
+#     # sampler = data.get_sampler(trainset, args)
+#     # train_loader = DataLoader(trainset, shuffle=True, sampler=sampler, collate_fn=collate_fn,
+#     #                           **loader_kwargs)
+#     train_loader = DataLoader(trainset, shuffle=True, **loader_kwargs)
+#     holdout_loaders = {}
+#     for name, ds in holdoutsets.items():
+#         shuffle = True if (name == "val" and finetune_on_val) else False
+#         # shuffle = True if (name == "test" and finetune_on_val) else False
+#         holdout_loaders[name] = DataLoader(ds, shuffle=shuffle, **loader_kwargs)
+#     return train_loader, holdout_loaders
+#     # new_holdout_loaders = {}
+#     # new_holdout_loaders["val"] = holdout_loaders["test"]
+#     # new_holdout_loaders["test"] = holdout_loaders["val"]
+#     # return train_loader, new_holdout_loaders
 
 
 def get_data_phases(args, finetune_on_val=True):

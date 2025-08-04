@@ -8,8 +8,10 @@ from utils.common_utils import get_default_args
 from utils.common_utils import set_seed
 from utils.supervised_utils import train_epoch
 from utils.supervised_utils import eval_model
+from utils.supervised_utils import get_classifier_and_feature_extractor
 from utils.logging import TrainLogger
 from utils.general import print_time_taken
+from models.model_utils import MILCBMWrapperModel
 
 
 def train_supervised(args):
@@ -24,18 +26,30 @@ def train_supervised(args):
     model = getattr(models, args.model)(train_loader.dataset.n_classes).to(device)
     Log.logger.info(f'Model has {utils.count_parameters(model) / 1e6:.2g}M parameters')
 
-    optimizer = getattr(optimizers, args.optimizer)(model, args)
+    if args.dataset == "SpuriousWithMasksDataset":
+        mil_model = MILCBMWrapperModel(
+            num_classes=2,
+            clip_dim=args.clip_dim,
+        )
+        mil_model = mil_model.to(device)
+        _, model = get_classifier_and_feature_extractor(model)
+        model = model.to(device)
+        optimizer = getattr(optimizers, args.optimizer)((model, mil_model), args)
+    else:
+        mil_model = None
+        optimizer = getattr(optimizers, args.optimizer)(model, args)
+
     scheduler = getattr(optimizers, args.scheduler)(optimizer, args)
     criterion = getattr(losses, args.loss)(args)
 
     for epoch in range(args.num_epochs):
-        info = train_epoch(model, train_loader, optimizer, criterion, device, epoch)
+        info = train_epoch(model, mil_model, train_loader, optimizer, criterion, device, epoch)
         loss_meter, acc_groups = info
         Log.logger.info(f"E: {epoch} | L: {loss_meter.avg:2.5e}\n")
         Log.log_train_results_and_save_chkp(epoch, acc_groups, model, optimizer, scheduler)
 
         if (epoch % args.eval_freq == 0) or (epoch == args.num_epochs - 1):
-            results_dict = eval_model(model, holdout_loaders, device=device)
+            results_dict = eval_model(model, mil_model, holdout_loaders, device=device)
             Log.log_results_save_chkp(model, epoch, results_dict)
 
     Log.finalize_logging(model)

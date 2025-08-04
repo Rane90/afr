@@ -1,4 +1,5 @@
 from .datasets import SpuriousDataset
+from .datasets import SpuriousWithMasksDataset
 from .datasets import MultiNLIDataset
 from .datasets import FakeSpuriousCIFAR10
 from .datasets import WildsFMOW

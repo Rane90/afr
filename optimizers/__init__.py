@@ -1,3 +1,4 @@
+import torch
 from torch.optim import AdamW
 from torch.optim import SGD
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -8,10 +9,28 @@ def sgd_optimizer_fromparams(params, lr, momentum, weight_decay):
     return optimizer
 
 
-def sgd_optimizer(model, args):
-    lr, momentum, weight_decay = args.init_lr, args.momentum, args.weight_decay
-    optimizer = SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
-    return optimizer
+# def sgd_optimizer(model, args):
+#     lr, momentum, weight_decay = args.init_lr, args.momentum, args.weight_decay
+#     optimizer = SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
+#     return optimizer
+
+def sgd_optimizer(models_or_params, args):
+    if isinstance(models_or_params, (tuple, list)):
+        # Combine parameters from multiple models
+        params = []
+        for m in models_or_params:
+            params += list(m.parameters())
+    elif isinstance(models_or_params, torch.nn.Module):
+        params = models_or_params.parameters()
+    else:
+        params = models_or_params  # assume already parameter list
+
+    return torch.optim.SGD(
+        params,
+        lr=args.init_lr,
+        momentum=args.momentum,
+        weight_decay=args.weight_decay
+    )
 
 
 def adamw_optimizer(model, args):

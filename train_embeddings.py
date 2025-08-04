@@ -10,7 +10,7 @@ from utils.common_utils import get_embeddings_args
 from utils.common_utils import set_seed
 from utils.common_utils import get_embeddings_loader
 from utils.supervised_utils import get_classifier_and_feature_extractor
-from utils.supervised_utils import take_step
+from utils.supervised_utils import take_step, load_concepts_and_clip_embeddings
 from utils.supervised_utils import get_last_layer_model
 from utils.supervised_utils import rebalance_weights
 from utils.supervised_utils import normalize_weights
@@ -20,7 +20,7 @@ from utils.general import print_time_taken
 
 
 def train_embeddings(args):
-    assert args.emb_batch_size == -1, f'AFR assumes full batch size (args.emb_batch_size = -1), but got {args.emb_batch_size}'
+    # assert args.emb_batch_size == -1, f'AFR assumes full batch size (args.emb_batch_size = -1), but got {args.emb_batch_size}'
     tic = time.time()
     device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
     set_seed(args.seed)
@@ -43,16 +43,26 @@ def train_embeddings(args):
     Embedder = EmbeddingManager(device, args)
     loaders = (train_loader, holdout_loaders)
     all_out = Embedder.get_train_test_embeddings(classifier, feature_extractor, loaders)
+    
     out, out_test, out_val = all_out
-    test_embeddings, _, test_groups, test_y = out_test
-    val_embeddings, _, val_groups, val_y = out_val
-    embeddings, _, groups, y = out
+    test_embeddings, test_bag_embeddings, _, test_groups, test_y, test_concepts, test_clip_scores = out_test
+    val_embeddings, val_bag_embeddings, _, val_groups, val_y, val_concepts, val_clip_scores = out_val
+    embeddings, bag_embeddings, _, groups, y, concepts, clip_scores = out
+    
     logits = classifier(embeddings).detach()
     weights = get_exp_weights(logits, y, gamma=args.gamma)
     if args.rebalance_weights:
         weights = rebalance_weights(weights, y)
     weights = normalize_weights(weights)
-    loader = get_embeddings_loader(args.emb_batch_size, embeddings, y, weights)
+    loader = get_embeddings_loader(
+        args.emb_batch_size,
+        embeddings,
+        y,
+        weights,
+        bag_embeddings=bag_embeddings,
+        concepts=concepts,
+        clip_scores=clip_scores
+    )
     init_weights = (classifier.weight.detach().clone(), classifier.bias.detach().clone())
     Log.log_group_weights(weights, groups, epoch=0)
 
@@ -61,17 +71,27 @@ def train_embeddings(args):
     Log.save_holdout_data(test_data=(test_embeddings, test_y, test_groups),
                           val_data=(val_embeddings, val_y, val_groups))
 
-    last_layer = get_last_layer_model(init_weights).to(device)
+
+    mil_model, last_layer = get_last_layer_model(args, init_weights)
+    last_layer = last_layer.to(device)
     last_layer.train()
-    optimizer = getattr(optimizers, args.optimizer)(last_layer, args)
+    if mil_model:
+        mil_model = mil_model.to(device)
+        mil_model.train()
+        all_concepts, clip_text_embeddings = load_concepts_and_clip_embeddings(args.dataset, device, args.base_model_dir)
+        optimizer = getattr(optimizers, args.optimizer)((last_layer, mil_model), args)
+    else:
+        all_concepts, clip_text_embeddings = None, None
+        optimizer = getattr(optimizers, args.optimizer)(last_layer, args)
+        
     scheduler = getattr(optimizers, args.scheduler)(optimizer, args)
     criterion = getattr(losses, args.loss)()
 
     for epoch in range(args.num_epochs):
         all_logits = []
         for ds in loader:
-            loss, logits = take_step(last_layer, ds, optimizer, criterion, scheduler, init_weights,
-                                     args.reg_coeff, max_norm=args.grad_norm)
+            loss, logits = take_step(mil_model, last_layer, ds, optimizer, criterion, scheduler, init_weights,
+                                     args.reg_coeff, all_concepts, clip_text_embeddings, epoch, args.num_epochs, max_norm=args.grad_norm)
             all_logits.append(logits)
         logits = torch.concat(all_logits, dim=0)
         if epoch > -1:

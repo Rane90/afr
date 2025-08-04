@@ -11,7 +11,11 @@ from torchvision.datasets import ImageFolder
 from torchvision.transforms import ToTensor
 from typing import Callable, cast, Tuple
 import wilds
-
+from scipy.ndimage import distance_transform_edt
+import torchvision.transforms.functional as TF
+from pathlib import Path
+import json
+from torchvision import transforms
 
 def _bincount_array_as_tensor(arr):
     return torch.from_numpy(np.bincount(arr)).long()
@@ -53,7 +57,6 @@ def _cast_int(arr):
     else:
         raise NotImplementedError
 
-
 class SpuriousDataset(Dataset):
     def __init__(self, basedir, split="train", transform=None, prop=1.0, seed=21, max_prop=1.0):
         self.basedir = basedir
@@ -71,10 +74,18 @@ class SpuriousDataset(Dataset):
         self._count_groups()
         self.filename_array = self.metadata_df["img_filename"].values
 
+        # if "spawrious" in basedir:
+        #     self.filename_array = [val.replace("images/", "") for val in self.filename_array]
+
     def _get_metadata(self, split):
         split_i = _get_split(split)
         metadata_df = pd.read_csv(os.path.join(self.basedir, "metadata.csv"))
+        if "filename" in metadata_df:
+            metadata_df.rename(columns={"class_label": "y", "spurious_attribute": "place", "filename": "img_filename"}, inplace=True)
+            mapping = {'train': 0, 'val': 1, 'test': 2}
+            metadata_df['split'] = metadata_df['split'].map(mapping)
         metadata_df = metadata_df[metadata_df["split"] == split_i]
+
         return metadata_df
 
     def _count_attributes(self):
@@ -102,12 +113,180 @@ class SpuriousDataset(Dataset):
         file_path = self.filename_array[idx]
         return x, y, group, is_spurious, file_path
 
+    # def _image_getitem(self, idx):
+    #     img_path = os.path.join(self.basedir, self.filename_array[idx])
+    #     img = Image.open(img_path).convert("RGB")
+    #     if self.transform:
+    #         img = self.transform(img)
+    #     return img
     def _image_getitem(self, idx):
         img_path = os.path.join(self.basedir, self.filename_array[idx])
-        img = Image.open(img_path).convert("RGB")
-        if self.transform:
-            img = self.transform(img)
+        # Use with-statement to ensure file is closed after loading
+        with Image.open(img_path) as img:
+            img = img.convert("RGB")
+            if self.transform:
+                img = self.transform(img)
         return img
+
+
+class SpuriousWithMasksDataset(Dataset):
+    def __init__(self, spurious_dataset: SpuriousDataset, mask_data_root: str, split: str, **mask_args):
+        self.spurious_dataset = spurious_dataset
+        self.split = split
+        self.root = Path(mask_data_root)
+
+        # Load cache
+        if "waterbird" in mask_data_root: 
+            cache_path = self.root / f"waterbirds_split_cache_{split}.json"
+            print(f"📖 Loading Waterbirds cache: {cache_path}")
+            with open(cache_path, "r") as f:
+                self.cache = json.load(f)
+        elif "celebA" in mask_data_root:
+            cache_path = self.root / f"celeba_split_cache_{split}.json"
+            print(f"📖 Loading celebA cache: {cache_path}")
+            with open(cache_path, "r") as f:
+                self.cache = json.load(f)            
+        elif "spawrious" in mask_data_root:
+            cache_path = self.root / f"spawrious_split_cache_{split}.json"
+            print(f"📖 Loading spawrious cache: {cache_path}")
+            with open(cache_path, "r") as f:
+                self.cache = json.load(f)            
+
+        # Filter spurious_dataset to keep only entries in image_to_index
+        original_len = len(self.spurious_dataset)
+
+        if "spawrious" not in mask_data_root:
+            self.image_to_index = {
+                img_path.replace("images/", ""): i for i, img_path in enumerate(self.cache["images"])
+            }
+
+
+            # if "spawrious" not in mask_data_root:
+            # Build a mask for valid indices
+            valid_mask = [
+                filename in self.image_to_index
+                for filename in self.spurious_dataset.filename_array
+            ]
+
+            # Apply the mask to filter metadata_df and all related arrays
+            self.spurious_dataset.metadata_df = self.spurious_dataset.metadata_df[valid_mask].reset_index(drop=True)
+            self.spurious_dataset.y_array = self.spurious_dataset.y_array[valid_mask]
+            self.spurious_dataset.spurious_array = self.spurious_dataset.spurious_array[valid_mask]
+            self.spurious_dataset.filename_array = self.spurious_dataset.filename_array[valid_mask]
+            self.spurious_dataset.group_array = self.spurious_dataset.group_array[valid_mask]
+
+            # Print how many entries were removed
+            removed_count = original_len - len(self.spurious_dataset)
+            print(f"🗑️ Filtered out {removed_count} entries not in mask cache.")
+        else:
+            self.image_to_index = {
+                img_path: i for i, img_path in enumerate(self.cache["images"])
+            }
+
+        self.segments = self.cache["segments"]
+        self.targets = self.cache["targets"]
+
+        # Load mask args
+        self.size = (mask_args.get("size", 224),) * 2
+        self.crop_scale = mask_args.get("crop_scale", (0.85, 1.0))
+        self.num_masks = mask_args.get("num_masks", 20)
+        self.masking_strategy = mask_args.get("masking_strategy", "mean_fill_dilation")
+        self.max_distance = mask_args.get("max_distance", 30.0)
+        self.alpha = mask_args.get("alpha", 0.1)
+        self.gradual_shrink = mask_args.get("gradual_shrink", False)
+        self.shrink_rate = mask_args.get("shrink_rate", 0.95)
+        self.current_epoch = mask_args.get("current_epoch", 0)
+        self.total_epochs = mask_args.get("total_epochs", 20)
+
+        self.mask_cache = {}
+
+    def __len__(self):
+        return len(self.spurious_dataset)
+
+    def __getitem__(self, idx):
+        # Get original data
+        s = 4
+        x, y, group, is_spurious, file_path = self.spurious_dataset[idx]
+
+        # Get filename
+        file_name = os.path.basename(file_path)
+        mask_index = self.image_to_index.get(file_path, None)
+        # print(file_path)
+        if mask_index is None:
+            # s = 4
+            raise ValueError(f"File {file_name} not found in mask cache for split {self.split}.")
+
+        segment_list = self.segments[mask_index]
+
+        # Ensure fixed bag size
+        bag_size = 5
+        if len(segment_list) >= bag_size:
+            segment_list = random.sample(segment_list, bag_size)
+        else:
+            extra = [random.choice(segment_list).copy() for _ in range(bag_size - len(segment_list))]
+            segment_list.extend(extra)
+
+        # Load masks, clip scores, concepts
+        masks, concepts, clip_scores = [], [], []
+        for seg in segment_list:
+            batch_file = seg["batch_file"]
+            mask_idx = seg["mask_index"]
+            if batch_file not in self.mask_cache:
+                self.mask_cache[batch_file] = np.load(self.root / batch_file)
+            mask = self.mask_cache[batch_file][mask_idx]
+            masks.append(torch.tensor(mask))
+            concepts.append(seg["concepts"])
+            clip_scores.append(seg["scores"])
+
+        # Apply mask transformation
+        img = TF.to_pil_image(x)  # transform expects PIL input
+        img_tensor, masked_instances, raw_instances = self._transform(img, masks)
+
+        return x, y, group, is_spurious, file_path, img_tensor, torch.stack(masked_instances), concepts, clip_scores, torch.stack(raw_instances)
+
+    def _transform(self, img, masks):
+        i, j, h, w = transforms.RandomResizedCrop.get_params(img, scale=self.crop_scale, ratio=(1.0, 1.0))
+        img = TF.resized_crop(img, i, j, h, w, self.size)
+
+        if random.random() < 0.5:
+            img = TF.hflip(img)
+            masks = [TF.hflip(TF.resized_crop(m.unsqueeze(0), i, j, h, w, self.size)).squeeze(0) for m in masks]
+        else:
+            masks = [TF.resized_crop(m.unsqueeze(0), i, j, h, w, self.size).squeeze(0) for m in masks]
+
+        img = transforms.ColorJitter(0.25, 0.25, 0.25)(img)
+        img_tensor = TF.to_tensor(img)
+
+        raw_instances = [(m > 0.5).float() * img_tensor for m in masks]
+        masked_instances = [self._apply_masking_strategy(img_tensor, m) for m in masks]
+        return img_tensor, masked_instances, raw_instances
+
+    def _apply_masking_strategy(self, img_tensor, mask_tensor):
+        mask_np = mask_tensor.numpy()
+        dist = distance_transform_edt(1 - mask_np)
+
+        if self.masking_strategy == "mean_fill_dilation":
+            mean_val = img_tensor.mean(dim=(1, 2), keepdim=True)
+            if self.gradual_shrink:
+                progress = min(self.current_epoch / self.total_epochs, 1.0)
+                max_distance = self.max_distance - (self.max_distance - 5.0) * progress
+            else:
+                max_distance = self.max_distance
+
+            soft_mask_np = np.ones_like(dist)
+            soft_mask_np[dist > max_distance] = 0.0
+            soft_mask = torch.from_numpy(soft_mask_np).float()
+
+            return soft_mask * img_tensor + (1 - soft_mask) * mean_val
+
+        else:
+            raise ValueError(f"Unsupported masking strategy: {self.masking_strategy}")
+
+    def __getattr__(self, name):
+        # Only called if the attribute is not found normally
+        return getattr(self.spurious_dataset, name)
+
+
 
 
 class JTTSpuriousDataset(SpuriousDataset):
@@ -205,11 +384,29 @@ class MultiNLIDataset(SpuriousDataset):
         return x, y, g, s
 
 
+# class EmbeddingsDataset:
+#     def __init__(self, embeddings, targets, weights):
+#         self.embeddings = embeddings
+#         self.targets = targets
+#         self.weights = weights
+
+#     def __len__(self):
+#         return len(self.targets)
+
+#     def __getitem__(self, idx):
+#         emb = self.embeddings[idx]
+#         y = self.targets[idx]
+#         w = self.weights[idx]
+#         return emb, y, w
+
 class EmbeddingsDataset:
-    def __init__(self, embeddings, targets, weights):
+    def __init__(self, embeddings, targets, weights, bag_embeddings=None, concepts=None, clip_scores=None):
         self.embeddings = embeddings
         self.targets = targets
         self.weights = weights
+        self.bag_embeddings = bag_embeddings
+        self.concepts = concepts
+        self.clip_scores = clip_scores
 
     def __len__(self):
         return len(self.targets)
@@ -218,7 +415,11 @@ class EmbeddingsDataset:
         emb = self.embeddings[idx]
         y = self.targets[idx]
         w = self.weights[idx]
-        return emb, y, w
+        bag_emb = self.bag_embeddings[idx] if self.bag_embeddings is not None else None
+        concept = self.concepts[idx] if self.concepts is not None else None
+        score = self.clip_scores[idx] if self.clip_scores is not None else None
+        return emb, y, w, bag_emb, concept, score
+
 
 
 class CirclesData(SpuriousDataset):

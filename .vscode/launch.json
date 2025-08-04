@@ -1,0 +1,77 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: Custom Training Script",
+            "type": "debugpy",
+            "request": "launch",
+            // "program": "/home/eng/eisenbr2/afr/train_embeddings.py",
+            "program": "/home/eng/eisenbr2/afr/train_supervised.py",
+            "console": "integratedTerminal",
+            "python": "/home/eng/eisenbr2/anaconda3/envs/cbm/bin/python",
+            "cwd": "/home/eng/eisenbr2/afr",
+            "args": [
+                "--use_wandb",
+                "--output_dir", "logs/waterbirds/82_0",
+                // "--output_dir", "logs/celeba/emb",
+                // "--output_dir", "logs/spawrious/emb",
+                "--project", "waterbirds",
+                "--seed", "1",
+                // "--base_model_dir", "logs/celeba/80_1",
+                // "--base_model_dir", "logs/waterbirds/emb",
+                // "--base_model_dir", "logs/spawrious/emb",
+                "--model", "imagenet_resnet50_pretrained",
+                // "--dataset", "SpuriousWithMasksDataset",
+                "--dataset", "SpuriousDataset",
+                "--data_dir", "/dsi/scratch/users/eisenbr2/waterbird_complete95_forest2water2",
+                // "--data_dir", "/dsi/scratch/users/eisenbr2/celebA/",
+                // "--data_dir", "/dsi/scratch/users/eisenbr2/spawrious/all/",
+                "--data_transform", "NoAugWaterbirdsCelebATransform",
+                // "--num_epochs", "1000",
+                "--num_epochs", "200",
+                "--batch_size", "32",
+                // "--emb_batch_size", "128",
+                // "--emb_batch_size", "-1",
+                "--optimizer", "sgd_optimizer",
+                "--scheduler", "constant_lr_scheduler",
+                // "--init_lr", "0.01",
+                "--init_lr", "0.02",
+                "--momentum", "0.",
+                "--weight_decay", "0.",
+
+                "--loss", "focal_loss",
+                // "--loss", "afr",
+
+                // "--tune_on", "train",
+                // // "--train_prop", "-20",
+                // "--train_prop", "-0.2",
+                // // "--gamma", "10",
+                // "--gamma", "1.44",
+                // "--num_augs", "1",
+                // "--grad_norm", "1.0",
+                // // "--reg_coeff", "0.0"
+                // "--reg_coeff", "0.1"
+            ]
+        }
+    ],
+    "env": {
+    "CUDA_VISIBLE_DEVICES": "2"
+    }
+}
+// CUDA_VISIBLE_DEVICES=2 python train_embeddings.py --use_wandb --output_dir logs/waterbirds/emb --project waterbirds --seed 2 --base_model_dir logs/waterbirds/80_0 --model imagenet_resnet50_pretrained --dataset SpuriousWithMasksDataset --data_dir /dsi/scratch/users/eisenbr2/waterbird_complete95_forest2water2 --data_transform NoAugWaterbirdsCelebATransform --num_epochs 500 --batch_size 128 --emb_batch_size -1 --optimizer sgd_optimizer --scheduler constant_lr_scheduler --init_lr 0.01 --momentum 0. --weight_decay 0. --loss afr --tune_on train --train_prop -20 --gamma 10 --num_augs 1 --grad_norm 1.0 --reg_coeff 0.0
+// CUDA_VISIBLE_DEVICES=2 python train_embeddings.py --use_wandb --output_dir logs/waterbirds/emb --project waterbirds --seed 2 --base_model_dir logs/waterbirds/80_0 --model imagenet_resnet50_pretrained --dataset SpuriousWithMasksDataset --data_dir /dsi/scratch/users/eisenbr2/waterbird_complete95_forest2water2 --data_transform NoAugWaterbirdsCelebATransform --num_epochs 145 --batch_size 128 --emb_batch_size -1 --optimizer sgd_optimizer --scheduler constant_lr_scheduler --init_lr 0.01 --momentum 0. --weight_decay 0. --loss afr --tune_on train --train_prop -20 --gamma 10 --num_augs 1 --grad_norm 1.0 --reg_coeff 0.0
+// python train_embeddings.py --use_wandb --output_dir logs/celeba/emb --project celeba --seed 1 --base_model_dir logs/celeba/80_1 --model imagenet_resnet50_pretrained --dataset SpuriousWithMasksDataset --data_dir /dsi/scratch/users/eisenbr2/celebA/ --data_transform NoAugWaterbirdsCelebATransform --num_epochs 1000 --batch_size 128 --emb_batch_size -1 --optimizer sgd_optimizer --scheduler constant_lr_scheduler --init_lr 0.02 --momentum 0. --weight_decay 0. --loss afr --tune_on train --train_prop -0.2 --gamma 1.44 --num_augs 1 --grad_norm 1.0 --reg_coeff 0.1
+
+// CUDA_VISIBLE_DEVICES=2 python train_supervised.py --use_wandb --output_dir logs/spawrious/emb --project spawrious --seed 1 --model imagenet_resnet50_pretrained --dataset SpuriousWithMasksDataset --data_dir /dsi/scratch/users/eisenbr2/spawrious/all/ --data_transform NoAugWaterbirdsCelebATransform --num_epochs 5 --batch_size 256 --optimizer sgd_optimizer --scheduler constant_lr_scheduler --init_lr 0.02 --momentum 0. --weight_decay 0. --eval_freq 5
+
+// CUDA_VISIBLE_DEVICES=2 python train_embeddings.py --use_wandb --output_dir logs/spawrious/emb --project spawrious --seed 1 --base_model_dir logs/spawrious/emb --model imagenet_resnet50_pretrained --dataset SpuriousWithMasksDataset --data_dir /dsi/scratch/users/eisenbr2/spawrious/all/ --data_transform NoAugWaterbirdsCelebATransform --num_epochs 10 --batch_size 256 --optimizer sgd_optimizer --scheduler constant_lr_scheduler --init_lr 0.02 --momentum 0. --weight_decay 0. --loss afr --tune_on train --train_prop -0.2 --gamma 1.44 --num_augs 1 --grad_norm 1.0 --reg_coeff 0.1
+// CUDA_VISIBLE_DEVICES=2 python train_embeddings.py --use_wandb --output_dir logs/spawrious/emb --project spawrious --seed 1 --base_model_dir logs/spawrious/emb --model imagenet_resnet50_pretrained --dataset SpuriousDataset --data_dir /dsi/scratch/users/eisenbr2/spawrious/all/ --data_transform NoAugWaterbirdsCelebATransform --num_epochs 10 --batch_size 256 --optimizer sgd_optimizer --scheduler constant_lr_scheduler --init_lr 0.02 --momentum 0. --weight_decay 0. --loss afr --tune_on train --train_prop -0.2 --gamma 1.44 --num_augs 1 --grad_norm 1.0 --reg_coeff 0.1
+
+
+// CUDA_VISIBLE_DEVICES=2 python train_embeddings.py --use_wandb --output_dir logs/spawrious/emb --project spawrious --seed 1 --base_model_dir logs/spawrious/emb --model imagenet_resnet50_pretrained --dataset SpuriousWithMasksDataset --data_dir /dsi/scratch/users/eisenbr2/spawrious/all/ --data_transform NoAugWaterbirdsCelebATransform --num_epochs 100 --batch_size 256 --optimizer sgd_optimizer --scheduler constant_lr_scheduler --init_lr 0.02 --momentum 0. --weight_decay 0. --loss cross_entropy --tune_on train --train_prop -0.2 --gamma 1.44 --num_augs 1 --grad_norm 1.0 --reg_coeff 0.1
+
+// CUDA_VISIBLE_DEVICES=2 python train_supervised.py --use_wandb --output_dir=logs/waterbirds/82_0 --project=waterbirds --seed=0 --eval_freq=10 --save_freq=10 --data_dir='/dsi/scratch/users/eisenbr2/waterbird_complete95_forest2water2' --dataset=SpuriousDataset --data_transform=AugWaterbirdsCelebATransform --model='imagenet_resnet50_pretrained' --max_prop=1.0 --train_prop=80 --num_epochs=50 --batch_size=32 --optimizer=sgd_optimizer --scheduler=constant_lr_scheduler --init_lr=0.003 --weight_decay=1e-4 --loss focal_loss --gamma 2 
+// CUDA_VISIBLE_DEVICES=2 python train_supervised.py --use_wandb --output_dir=logs/waterbirds/82_0 --project=waterbirds --seed=0 --eval_freq=10 --save_freq=10 --data_dir='/dsi/scratch/users/eisenbr2/waterbird_complete95_forest2water2' --dataset=SpuriousDataset --data_transform=AugWaterbirdsCelebATransform --model='imagenet_resnet50_pretrained' --max_prop=1.0 --train_prop=80 --num_epochs=50 --batch_size=32 --optimizer=sgd_optimizer --scheduler=constant_lr_scheduler --init_lr=0.003 --weight_decay=1e-4 
